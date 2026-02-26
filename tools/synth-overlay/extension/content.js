@@ -31,6 +31,22 @@
     return Math.max(5, Math.min(100, Math.round(score * 100)));
   }
 
+  function formatTime(isoString) {
+    if (!isoString || typeof isoString !== "string") return "";
+    var d = new Date(isoString.trim());
+    if (isNaN(d.getTime())) return isoString;
+    var months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    var mon = months[d.getUTCMonth()];
+    var day = d.getUTCDate();
+    var h = d.getUTCHours();
+    var m = d.getUTCMinutes();
+    var ampm = h >= 12 ? "PM" : "AM";
+    h = h % 12;
+    if (h === 0) h = 12;
+    var min = m < 10 ? "0" + m : String(m);
+    return mon + " " + day + ", " + h + ":" + min + " " + ampm + " UTC";
+  }
+
   function escapeHtml(s) {
     var div = document.createElement("div");
     div.textContent = s;
@@ -72,7 +88,7 @@
           ' <div class="synth-overlay-conf-bar"><div class="synth-overlay-conf-fill" style="width:' + barWidth + '%"></div></div>' +
         "</div>" +
         noTradeRow +
-        '<div class="synth-overlay-detail-meta">' + escapeHtml(data.current_time || "") + "</div>" +
+        '<div class="synth-overlay-detail-meta">' + escapeHtml(formatTime(data.current_time) || "") + "</div>" +
         '<div class="synth-overlay-detail-expand">Details \u25B6</div>' +
       "</div>";
 
@@ -148,7 +164,7 @@
             "</div>"
           : "") +
         '<div class="synth-overlay-panel-meta">Last update: ' +
-          escapeHtml(data.current_time || "unknown") + "</div>" +
+          escapeHtml(formatTime(data.current_time) || "unknown") + "</div>" +
       "</div>";
 
     var closeBtn = panel.querySelector(".synth-overlay-panel-close");
@@ -182,16 +198,6 @@
   }
 
   function findInjectionTarget() {
-    var selectors = [
-      "[class*='market']",
-      "[class*='outcome']",
-      "main",
-      "[role='main']",
-    ];
-    for (var i = 0; i < selectors.length; i++) {
-      var el = document.querySelector(selectors[i]);
-      if (el && el.offsetParent) return el;
-    }
     return document.body;
   }
 
