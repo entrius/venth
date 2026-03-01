@@ -49,29 +49,45 @@ h2 {
     border-bottom: 1px solid rgba(255,255,255,0.1) !important;
 }
 
-/* DataFrames styling to match Gittensor Miner Tables */
-[data-testid="stDataFrame"] > div {
+/* Raw HTML Table Styling to bypass Streamlit's Canvas Data Grid */
+.table-container {
     background-color: #0a0f1f !important;
     border: 1px solid rgba(255, 255, 255, 0.1) !important;
     border-radius: 12px !important;
     padding: 1rem !important;
+    overflow-x: auto;
+    margin-top: 1rem;
 }
 
-/* Table Text */
-table, .stDataFrame td, .stDataFrame th {
+.gittensor-table {
+    width: 100%;
+    border-collapse: collapse;
     font-family: 'JetBrains Mono', monospace !important;
     color: #ffffff !important;
+    background-color: transparent !important;
+    font-size: 0.9rem;
 }
-th {
+
+.gittensor-table th {
     color: rgba(255, 255, 255, 0.5) !important;
     text-transform: uppercase !important;
     font-size: 0.75rem !important;
     letter-spacing: 0.05em !important;
     font-weight: 600 !important;
     border-bottom: 1px solid rgba(255,255,255,0.1) !important;
+    padding: 1rem;
+    text-align: left;
+    background-color: transparent !important;
 }
-td {
+
+.gittensor-table td {
+    padding: 1rem;
     border-bottom: 1px solid rgba(255,255,255,0.05) !important;
+    background-color: transparent !important;
+}
+
+.gittensor-table tr:last-child td {
+    border-bottom: none !important;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -186,9 +202,9 @@ def color_relative(val):
     if val == 0: color = "rgba(255, 255, 255, 0.7)"
     return f"color: {color}; font-weight: 600;"
 
-st.dataframe(
-    df.style.map(color_relative, subset=["Relative to SPY (%)", "Directional Skew (%)"])
+styled_df = (df.style.map(color_relative, subset=["Relative to SPY (%)", "Directional Skew (%)"])
             .format("{:.2f}%", subset=["Median Move (%)", "Directional Skew (%)", "Relative to SPY (%)"])
-            .format("{:.4f}", subset=["Forecasted Volatility"]),
-    use_container_width=True
-)
+            .format("{:.4f}", subset=["Forecasted Volatility"])
+            .set_table_attributes('class="gittensor-table"'))
+
+st.markdown(f'<div class="table-container">{styled_df.to_html()}</div>', unsafe_allow_html=True)
