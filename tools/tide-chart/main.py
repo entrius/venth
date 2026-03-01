@@ -85,20 +85,20 @@ h2 {
 }
 
 .gittensor-table th {
-    color: rgba(255, 255, 255, 0.5) !important;
+    color: rgba(255, 255, 255, 0.45) !important;
     text-transform: uppercase !important;
-    font-size: 0.7rem !important;
+    font-size: 0.65rem !important;
     letter-spacing: 0.05em !important;
     font-weight: 600 !important;
     border: none !important;
     border-bottom: 1px solid rgba(255,255,255,0.1) !important;
-    padding: 1rem 1.5rem !important;
+    padding: 8px 16px !important;
     text-align: left;
     background-color: transparent !important;
 }
 
 .gittensor-table td {
-    padding: 1rem 1.5rem !important;
+    padding: 8px 16px !important;
     border: none !important;
     background-color: transparent !important;
     color: rgba(255, 255, 255, 0.9) !important;
@@ -163,11 +163,12 @@ for ticker, metrics in data.items():
         lowerfence=[metrics["downside_tail_pct"]],
         upperfence=[metrics["upside_tail_pct"]],
         x=[ticker],
-        fillcolor=fill_colors.get(ticker),
-        line=dict(width=2, color=colors.get(ticker)),
+        fillcolor="rgba(0,0,0,0.8)", # Hollow candle look
+        line=dict(width=3, color=colors.get(ticker)), # Thick, bright borders
         hoverinfo="y+name",
-        whiskerwidth=0.8,
-        marker=dict(size=4, color=colors.get(ticker), outliercolor="rgba(0,0,0,0)")
+        whiskerwidth=0.2, # Sharp wicks
+        boxpoints=False, # Completely hide statistical outliers to resemble a candle
+        marker=dict(size=0, color="rgba(0,0,0,0)")
     ))
 
 fig.update_layout(
@@ -203,27 +204,39 @@ st.markdown("<h3 style='margin-bottom:0.5rem; margin-top: 1rem;'>The Rank Table<
 st.markdown("<p style='color: rgba(255,255,255,0.5); font-size:0.9rem; margin-bottom:1rem;'>Sorts all 5 equities by key metrics derived from the Synth forecast.</p>", unsafe_allow_html=True)
 
 df_data = []
-for ticker, metrics in data.items():
+sorted_items = sorted(data.items(), key=lambda x: x[1]["median_move_pct"], reverse=True)
+
+for i, (ticker, metrics) in enumerate(sorted_items):
+    # CSS badge for rank (replicating Gittensor Repositories UI exactly)
+    rank_html = f'<div style="width:24px;height:24px;border:1px solid rgba(255,255,255,0.15);border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:0.75rem;color:rgba(255,255,255,0.6);font-family:\'JetBrains Mono\',monospace;">{i+1}</div>'
+    
+    # Avatar colors
+    avatar_color = "transparent"
+    if ticker == "NVDA": avatar_color = "#fff30d"
+    elif ticker == "TSLA": avatar_color = "#1d37fc"
+    elif ticker == "SPY": avatar_color = "#ffffff"
+    elif ticker == "AAPL": avatar_color = "#a8a8a8"
+    elif ticker == "GOOGL": avatar_color = "#ea4335"
+    
+    # Ticker combo with 'Gold' badge emulation
+    badge = '<span style="color:#fff30d;font-size:0.6rem;border:1px solid rgba(255,243,13,0.3);padding:2px 6px;border-radius:4px;letter-spacing:0.05em;margin-left:8px;">Gold</span>' if i < 3 else ''
+    ticker_html = f'<div style="display:flex;align-items:center;gap:12px;"><div style="width:24px;height:24px;border-radius:50%;border:1px solid rgba(255,255,255,0.2);background-color:{avatar_color};box-shadow: 0 0 8px {avatar_color}40;"></div><span style="font-weight:600;color:rgba(255,255,255,0.9);">{ticker}</span>{badge}</div>'
+
+    # Status colored relative metrics
+    rel_color = "#51cf66" if metrics["relative_to_spy_pct"] > 0 else "#ff6b6b"
+    if metrics["relative_to_spy_pct"] == 0: rel_color = "rgba(255,255,255,0.5)"
+    
     df_data.append({
-        "Ticker": ticker,
-        "Median Move (%)": round(metrics["median_move_pct"], 2),
-        "Forecasted Volatility": round(metrics["volatility"], 4),
-        "Directional Skew (%)": round(metrics["skew_pct"], 2),
-        "Relative to SPY (%)": round(metrics["relative_to_spy_pct"], 2)
+        "Rank": rank_html,
+        "Asset": ticker_html,
+        "Median Move ▼": f'<span style="font-weight:600;color:rgba(255,255,255,0.9);">{metrics["median_move_pct"]:.2f}%</span>',
+        "Forecasted Volatility": f'<span style="color:rgba(255,255,255,0.7);">{metrics["volatility"]:.4f}</span>',
+        "Directional Skew": f'<span style="color:rgba(255,255,255,0.7);">{metrics["skew_pct"]:.2f}%</span>',
+        "Relative to SPY": f'<span style="color:{rel_color};font-weight:600;background-color:{rel_color}15;padding:2px 6px;border-radius:4px;">{metrics["relative_to_spy_pct"]:.2f}%</span>'
     })
 
 df = pd.DataFrame(df_data)
 
-# Highlight relative strength vs SPY using Gittensor Status Colors
-def color_relative(val):
-    color = "#3fb950" if val > 0 else "#ef4444" # Merged Green / Closed Red
-    if val == 0: color = "rgba(255, 255, 255, 0.7)"
-    return f"color: {color}; font-weight: 600;"
-
-styled_df = (df.style.map(color_relative, subset=["Relative to SPY (%)", "Directional Skew (%)"])
-            .format("{:.2f}%", subset=["Median Move (%)", "Directional Skew (%)", "Relative to SPY (%)"])
-            .format("{:.4f}", subset=["Forecasted Volatility"])
-            .hide(axis="index")
-            .set_table_attributes('class="gittensor-table"'))
-
-st.markdown(f'<div class="table-container">{styled_df.to_html()}</div>', unsafe_allow_html=True)
+# Push native HTML skipping any Streamlit grid overrides completely
+html_table = df.to_html(escape=False, index=False, classes="gittensor-table")
+st.markdown(f'<div class="table-container">{html_table}</div>', unsafe_allow_html=True)
