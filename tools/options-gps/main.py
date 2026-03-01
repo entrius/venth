@@ -65,7 +65,9 @@ def main():
             print(f"Strikes:      {play['strikes']}")
         else:
             print(f"Strike:       {play['strike']}")
-        print(f"Max Loss:     ${play['max_loss']:,.2f}")
+        
+        profit_str = "Infinite" if play['max_profit'] == float('inf') else f"${play['max_profit']:,.2f}"
+        print(f"Max Loss:     ${play['max_loss']:,.2f} | Max Profit: {profit_str}")
         print(f"PoP:          {play['pop']}%")
         print(f"Why it works: {play['rationale']}")
         
