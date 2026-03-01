@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Polymarket Synth Overlay Demo</title>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap"
+        rel="stylesheet">
+    <style>
+        body {
+            background-color: #0d111c;
+            color: #ffffff;
+            font-family: 'Inter', sans-serif;
+            margin: 0;
+            padding: 40px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        .market-card {
+            background-color: #1a2033;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 12px;
+            width: 480px;
+            padding: 24px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+        }
+
+        .market-header {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 16px;
+        }
+
+        .market-icon {
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            background-color: #ffffff;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .market-title {
+            font-size: 1.25rem;
+            font-weight: 600;
+            line-height: 1.4;
+        }
+
+        .market-stats {
+            display: flex;
+            gap: 16px;
+            font-size: 0.85rem;
+            color: rgba(255, 255, 255, 0.6);
+            margin-bottom: 24px;
+            padding-bottom: 16px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .market-stats span {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .bet-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 12px;
+            background-color: rgba(255, 255, 255, 0.03);
+            border-radius: 8px;
+            margin-bottom: 12px;
+            transition: background 0.2s;
+            cursor: pointer;
+            position: relative;
+        }
+
+        .bet-row:hover {
+            background-color: rgba(255, 255, 255, 0.08);
+        }
+
+        .outcome-name {
+            font-weight: 600;
+            font-size: 1.1rem;
+        }
+
+        .bet-btn {
+            background-color: #2172e5;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            padding: 8px 16px;
+            font-weight: 600;
+            font-size: 0.9rem;
+            cursor: pointer;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            width: 80px;
+        }
+
+        .bet-btn.no {
+            background-color: #eb5757;
+        }
+
+        .bet-btn span.price {
+            font-size: 0.75rem;
+            opacity: 0.8;
+            margin-top: 2px;
+        }
+
+        /* SIMULATED GITTENSOR OVERLAY STYLES */
+        .gittensor-badge {
+            position: absolute;
+            left: -120px;
+            opacity: 0;
+            transform: translateX(10px);
+            transition: all 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            background: linear-gradient(135deg, rgba(29, 55, 252, 0.95), rgba(0, 20, 100, 0.95));
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            padding: 6px 12px;
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(29, 55, 252, 0.4);
+            pointer-events: none;
+        }
+
+        .gittensor-badge.show {
+            opacity: 1;
+            transform: translateX(0);
+        }
+
+        .gittensor-badge.red {
+            background: linear-gradient(135deg, rgba(235, 87, 87, 0.95), rgba(150, 0, 0, 0.95));
+            box-shadow: 0 4px 12px rgba(235, 87, 87, 0.4);
+            left: -110px;
+        }
+
+        .gt-logo {
+            width: 16px;
+            height: 16px;
+            background-image: url('https://gittensor.io/gt-logo-white.png');
+            background-size: cover;
+            border-radius: 4px;
+        }
+
+        .gt-text {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.75rem;
+            font-weight: 600;
+            color: white;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="market-card">
+        <div class="market-header">
+            <div class="market-icon"><img src="https://cryptologos.cc/logos/bitcoin-btc-logo.svg?v=032" width="24"
+                    height="24" alt="BTC"></div>
+            <div class="market-title">Will Bitcoin reach $100k in 2026?</div>
+        </div>
+        <div class="market-stats">
+            <span>💰 $4.2M Vol.</span>
+            <span>⏱️ Closes Feb 28</span>
+        </div>
+
+        <div class="bet-row" id="row-yes">
+            <div class="gittensor-badge" id="badge-yes">
+                <div class="gt-logo"></div>
+                <div class="gt-text">BUY YES</div>
+            </div>
+            <span class="outcome-name">Yes</span>
+            <button class="bet-btn">
+                <span>Buy</span>
+                <span class="price">74¢</span>
+            </button>
+        </div>
+
+        <div class="bet-row" id="row-no">
+            <div class="gittensor-badge red" id="badge-no">
+                <div class="gt-logo"></div>
+                <div class="gt-text">AVOID</div>
+            </div>
+            <span class="outcome-name">No</span>
+            <button class="bet-btn no">
+                <span>Buy</span>
+                <span class="price">26¢</span>
+            </button>
+        </div>
+    </div>
+
+    <script>
+        // Simulate extension injection after delay
+        setTimeout(() => {
+            document.getElementById('badge-yes').classList.add('show');
+            // Give 'No' a slight stagger
+            setTimeout(() => {
+                document.getElementById('badge-no').classList.add('show');
+            }, 300);
+        }, 3000);
+    </script>
+</body>
+
+</html>
