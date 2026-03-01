@@ -104,15 +104,23 @@ st.markdown("<p style='color: rgba(255,255,255,0.5); font-size:0.9rem; margin-bo
 fig = go.Figure()
 
 colors = {
-    "SPY": "rgba(255, 255, 255, 0.7)",
+    "SPY": "rgba(255, 255, 255, 0.4)",
     "NVDA": "#fff30d", # Gittensor Secondary
     "TSLA": "#1d37fc", # Gittensor Primary
-    "AAPL": "rgba(255, 255, 255, 0.7)",
-    "GOOGL": "rgba(255, 255, 255, 0.7)"
+    "AAPL": "rgba(255, 255, 255, 0.4)",
+    "GOOGL": "rgba(255, 255, 255, 0.4)"
+}
+
+fill_colors = {
+    "SPY": "rgba(255, 255, 255, 0.05)",
+    "NVDA": "rgba(255, 243, 13, 0.1)",
+    "TSLA": "rgba(29, 55, 252, 0.15)",
+    "AAPL": "rgba(255, 255, 255, 0.05)",
+    "GOOGL": "rgba(255, 255, 255, 0.05)"
 }
 
 for ticker, metrics in data.items():
-    # Plot as a vertical range bar with a median marker
+    # Plotting using a stylized Candlestick/Box hybrid to look more 'trading-oriented'
     fig.add_trace(go.Box(
         name=ticker,
         q1=[metrics["downside_tail_pct"]],
@@ -120,12 +128,12 @@ for ticker, metrics in data.items():
         q3=[metrics["upside_tail_pct"]],
         lowerfence=[metrics["downside_tail_pct"]],
         upperfence=[metrics["upside_tail_pct"]],
-        marker_color=colors.get(ticker, "rgba(255, 255, 255, 0.5)"),
-        boxpoints=False,
         x=[ticker],
-        fillcolor='rgba(0, 0, 0, 0)',
-        line=dict(width=2, color=colors.get(ticker, "rgba(255, 255, 255, 0.5)")),
-        hoverinfo="y+name"
+        fillcolor=fill_colors.get(ticker),
+        line=dict(width=2, color=colors.get(ticker)),
+        hoverinfo="y+name",
+        whiskerwidth=0.8,
+        marker=dict(size=4, color=colors.get(ticker), outliercolor="rgba(0,0,0,0)")
     ))
 
 fig.update_layout(
@@ -138,14 +146,16 @@ fig.update_layout(
     height=450,
     margin=dict(l=40, r=20, t=10, b=40),
     xaxis=dict(
-        showgrid=False, 
+        showgrid=True, 
+        gridcolor='rgba(255, 255, 255, 0.03)',
         zeroline=False,
         tickfont=dict(family="JetBrains Mono, monospace", size=14, color="#ffffff")
     ),
     yaxis=dict(
+        showgrid=True,
         gridcolor='rgba(255, 255, 255, 0.05)',
         zerolinecolor='rgba(255, 255, 255, 0.2)',
-        zerolinewidth=1,
+        zerolinewidth=2,
         tickfont=dict(family="JetBrains Mono, monospace")
     )
 )
