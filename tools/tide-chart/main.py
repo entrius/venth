@@ -54,7 +54,7 @@ h2 {
     background-color: #0a0f1f !important;
     border: 1px solid rgba(255, 255, 255, 0.1) !important;
     border-radius: 12px !important;
-    padding: 1rem !important;
+    padding: 0 !important;
     overflow-x: auto;
     margin-top: 1rem;
 }
@@ -65,28 +65,46 @@ h2 {
     font-family: 'JetBrains Mono', monospace !important;
     color: #ffffff !important;
     background-color: transparent !important;
-    font-size: 0.9rem;
+    font-size: 0.85rem;
+    border: none !important;
+}
+
+.gittensor-table thead, .gittensor-table tbody {
+    background-color: transparent !important;
+    border: none !important;
+}
+
+.gittensor-table tr {
+    background-color: transparent !important;
+    border-bottom: 1px solid rgba(255,255,255,0.05) !important;
+    transition: background-color 0.15s ease-in-out !important;
+}
+
+.gittensor-table tr:hover {
+    background-color: rgba(255,255,255,0.05) !important;
 }
 
 .gittensor-table th {
     color: rgba(255, 255, 255, 0.5) !important;
     text-transform: uppercase !important;
-    font-size: 0.75rem !important;
+    font-size: 0.7rem !important;
     letter-spacing: 0.05em !important;
     font-weight: 600 !important;
+    border: none !important;
     border-bottom: 1px solid rgba(255,255,255,0.1) !important;
-    padding: 1rem;
+    padding: 1rem 1.5rem !important;
     text-align: left;
     background-color: transparent !important;
 }
 
 .gittensor-table td {
-    padding: 1rem;
-    border-bottom: 1px solid rgba(255,255,255,0.05) !important;
+    padding: 1rem 1.5rem !important;
+    border: none !important;
     background-color: transparent !important;
+    color: rgba(255, 255, 255, 0.9) !important;
 }
 
-.gittensor-table tr:last-child td {
+.gittensor-table tr:last-child {
     border-bottom: none !important;
 }
 </style>
@@ -194,7 +212,7 @@ for ticker, metrics in data.items():
         "Relative to SPY (%)": round(metrics["relative_to_spy_pct"], 2)
     })
 
-df = pd.DataFrame(df_data).set_index("Ticker")
+df = pd.DataFrame(df_data)
 
 # Highlight relative strength vs SPY using Gittensor Status Colors
 def color_relative(val):
@@ -205,6 +223,7 @@ def color_relative(val):
 styled_df = (df.style.map(color_relative, subset=["Relative to SPY (%)", "Directional Skew (%)"])
             .format("{:.2f}%", subset=["Median Move (%)", "Directional Skew (%)", "Relative to SPY (%)"])
             .format("{:.4f}", subset=["Forecasted Volatility"])
+            .hide(axis="index")
             .set_table_attributes('class="gittensor-table"'))
 
 st.markdown(f'<div class="table-container">{styled_df.to_html()}</div>', unsafe_allow_html=True)
