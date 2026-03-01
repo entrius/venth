@@ -10,11 +10,11 @@
         rel="stylesheet">
     <style>
         body {
-            background-color: #0d111c;
+            background-color: #000;
             color: #ffffff;
             font-family: 'Inter', sans-serif;
             margin: 0;
-            padding: 40px;
+            padding: 0;
             display: flex;
             justify-content: center;
             align-items: center;
@@ -22,6 +22,182 @@
             overflow: hidden;
         }
 
+        /* Chrome Browser Shell */
+        .browser-window {
+            width: 800px;
+            height: 600px;
+            background-color: #0d111c;
+            border-radius: 8px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.8);
+        }
+
+        /* Title Bar & Tabs */
+        .title-bar {
+            background-color: #202124;
+            height: 40px;
+            display: flex;
+            align-items: flex-end;
+            padding: 0 16px;
+            gap: 12px;
+            padding-top: 8px;
+        }
+
+        .window-controls {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 12px;
+            margin-right: 12px;
+        }
+
+        .window-controls div {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+        }
+
+        .wc-red {
+            background-color: #ff5f56;
+        }
+
+        .wc-yellow {
+            background-color: #ffbd2e;
+        }
+
+        .wc-green {
+            background-color: #27c93f;
+        }
+
+        .chrome-tab {
+            background-color: #35363a;
+            height: 32px;
+            min-width: 200px;
+            border-radius: 8px 8px 0 0;
+            display: flex;
+            align-items: center;
+            padding: 0 12px;
+            font-size: 0.75rem;
+            color: #fff;
+            gap: 8px;
+        }
+
+        /* Navigation Bar */
+        .nav-bar {
+            background-color: #35363a;
+            height: 44px;
+            display: flex;
+            align-items: center;
+            padding: 0 16px;
+            gap: 16px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        .nav-buttons {
+            display: flex;
+            gap: 16px;
+            color: #9aa0a6;
+            font-size: 1.2rem;
+            letter-spacing: -2px;
+        }
+
+        .url-bar {
+            flex-grow: 1;
+            background-color: #202124;
+            height: 28px;
+            border-radius: 14px;
+            display: flex;
+            align-items: center;
+            padding: 0 16px;
+            font-size: 0.8rem;
+            color: #e8eaed;
+            font-family: 'Inter', sans-serif;
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        .url-bar span.https {
+            color: rgba(255, 255, 255, 0.5);
+        }
+
+        .extensions {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            position: relative;
+        }
+
+        .ext-icon {
+            width: 20px;
+            height: 20px;
+            border-radius: 4px;
+            background-color: rgba(255, 255, 255, 0.1);
+            cursor: pointer;
+            transition: transform 0.1s;
+        }
+
+        .ext-icon.gt {
+            background-image: url('https://gittensor.io/gt-logo-white.png');
+            background-size: cover;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }
+
+        .ext-icon.gt:hover {
+            transform: scale(1.1);
+            border-color: rgba(255, 255, 255, 0.5);
+        }
+
+        /* Extension Popup Status */
+        .ext-popup {
+            position: absolute;
+            top: 36px;
+            right: 0;
+            background-color: #1a2033;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 8px;
+            padding: 12px;
+            width: 200px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.2s, transform 0.2s;
+            transform: translateY(-10px);
+            z-index: 100;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+        }
+
+        .ext-popup.show {
+            opacity: 1;
+            transform: translateY(0);
+        }
+
+        .ext-status-dot {
+            width: 8px;
+            height: 8px;
+            background-color: #27c93f;
+            border-radius: 50%;
+            box-shadow: 0 0 8px #27c93f;
+        }
+
+        .ext-popup span {
+            font-size: 0.8rem;
+            font-weight: 500;
+        }
+
+        /* Page Content */
+        .page-content {
+            flex-grow: 1;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            position: relative;
+            background-color: #0d111c;
+        }
+
+        /* Polymarket Content */
         .market-card {
             background-color: #1a2033;
             border: 1px solid rgba(255, 255, 255, 0.1);
@@ -64,12 +240,6 @@
             border-bottom: 1px solid rgba(255, 255, 255, 0.1);
         }
 
-        .market-stats span {
-            display: flex;
-            align-items: center;
-            gap: 4px;
-        }
-
         .bet-row {
             display: flex;
             justify-content: space-between;
@@ -79,12 +249,7 @@
             border-radius: 8px;
             margin-bottom: 12px;
             transition: background 0.2s;
-            cursor: pointer;
             position: relative;
-        }
-
-        .bet-row:hover {
-            background-color: rgba(255, 255, 255, 0.08);
         }
 
         .outcome-name {
@@ -100,7 +265,6 @@
             padding: 8px 16px;
             font-weight: 600;
             font-size: 0.9rem;
-            cursor: pointer;
             display: flex;
             flex-direction: column;
             align-items: center;
@@ -133,6 +297,7 @@
             border-radius: 8px;
             box-shadow: 0 4px 12px rgba(29, 55, 252, 0.4);
             pointer-events: none;
+            z-index: 50;
         }
 
         .gittensor-badge.show {
@@ -159,56 +324,103 @@
             font-size: 0.75rem;
             font-weight: 600;
             color: white;
+            white-space: nowrap;
         }
     </style>
 </head>
 
 <body>
-    <div class="market-card">
-        <div class="market-header">
-            <div class="market-icon"><img src="https://cryptologos.cc/logos/bitcoin-btc-logo.svg?v=032" width="24"
-                    height="24" alt="BTC"></div>
-            <div class="market-title">Will Bitcoin reach $100k in 2026?</div>
-        </div>
-        <div class="market-stats">
-            <span>💰 $4.2M Vol.</span>
-            <span>⏱️ Closes Feb 28</span>
+    <div class="browser-window">
+        <!-- Title Bar -->
+        <div class="title-bar">
+            <div class="window-controls">
+                <div class="wc-red"></div>
+                <div class="wc-yellow"></div>
+                <div class="wc-green"></div>
+            </div>
+            <div class="chrome-tab">
+                <img src="https://polymarket.com/favicon.ico" width="14" height="14" style="border-radius:2px;">
+                Will Bitcoin reach $100k in 2026? - Polymarket
+            </div>
         </div>
 
-        <div class="bet-row" id="row-yes">
-            <div class="gittensor-badge" id="badge-yes">
-                <div class="gt-logo"></div>
-                <div class="gt-text">BUY YES</div>
+        <!-- Nav Bar -->
+        <div class="nav-bar">
+            <div class="nav-buttons">← → ↻</div>
+            <div class="url-bar">
+                <span class="https">https://</span>polymarket.com/event/bitcoin-100k-2026
             </div>
-            <span class="outcome-name">Yes</span>
-            <button class="bet-btn">
-                <span>Buy</span>
-                <span class="price">74¢</span>
-            </button>
+            <div class="extensions">
+                <div class="ext-icon" style="background-color: #eb5757; border-radius: 50%;"></div>
+                <div class="ext-icon gt" id="gt-ext-icon"></div>
+                <div class="ext-icon" style="background-color: #27c93f;"></div>
+
+                <!-- Popup -->
+                <div class="ext-popup" id="gt-popup">
+                    <div class="ext-status-dot"></div>
+                    <span>Synth Data Injected</span>
+                </div>
+            </div>
         </div>
 
-        <div class="bet-row" id="row-no">
-            <div class="gittensor-badge red" id="badge-no">
-                <div class="gt-logo"></div>
-                <div class="gt-text">AVOID</div>
+        <!-- Page Content -->
+        <div class="page-content">
+            <div class="market-card">
+                <div class="market-header">
+                    <div class="market-icon"><img src="https://cryptologos.cc/logos/bitcoin-btc-logo.svg?v=032"
+                            width="24" height="24" alt="BTC"></div>
+                    <div class="market-title">Will Bitcoin reach $100k in 2026?</div>
+                </div>
+                <div class="market-stats">
+                    <span>💰 $4.2M Vol.</span>
+                    <span>⏱️ Closes Feb 28</span>
+                </div>
+
+                <div class="bet-row" id="row-yes">
+                    <div class="gittensor-badge" id="badge-yes">
+                        <div class="gt-logo"></div>
+                        <div class="gt-text">BUY YES</div>
+                    </div>
+                    <span class="outcome-name">Yes</span>
+                    <button class="bet-btn">
+                        <span>Buy</span>
+                        <span class="price">74¢</span>
+                    </button>
+                </div>
+
+                <div class="bet-row" id="row-no">
+                    <div class="gittensor-badge red" id="badge-no">
+                        <div class="gt-logo"></div>
+                        <div class="gt-text">AVOID</div>
+                    </div>
+                    <span class="outcome-name">No</span>
+                    <button class="bet-btn no">
+                        <span>Buy</span>
+                        <span class="price">26¢</span>
+                    </button>
+                </div>
             </div>
-            <span class="outcome-name">No</span>
-            <button class="bet-btn no">
-                <span>Buy</span>
-                <span class="price">26¢</span>
-            </button>
         </div>
     </div>
 
     <script>
-        // Simulate extension injection after delay
-        setTimeout(() => {
-            document.getElementById('badge-yes').classList.add('show');
-            // Give 'No' a slight stagger
+        document.getElementById('gt-ext-icon').addEventListener('click', () => {
+            // Show extension active popup
+            const popup = document.getElementById('gt-popup');
+            popup.classList.add('show');
+
+            // Hide popup after 2s
+            setTimeout(() => { popup.classList.remove('show'); }, 2000);
+
+            // Inject DOM overlay badges
             setTimeout(() => {
-                document.getElementById('badge-no').classList.add('show');
-            }, 300);
-        }, 3000);
+                document.getElementById('badge-yes').classList.add('show');
+                // Give 'No' a slight stagger
+                setTimeout(() => {
+                    document.getElementById('badge-no').classList.add('show');
+                }, 300);
+            }, 600);
+        });
     </script>
 </body>
 
