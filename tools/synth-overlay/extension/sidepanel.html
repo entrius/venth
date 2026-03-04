@@ -37,10 +37,12 @@
     </section>
 
     <section class="card">
-      <div class="label">Signal</div>
-      <div class="row"><span id="horizonLabel">Primary</span><strong id="signalPrimary">—</strong></div>
-      <div class="row" id="refRow"><span id="refLabel">Reference</span><strong id="signalRef">—</strong></div>
-      <div class="row"><span>Strength</span><strong id="strength">—</strong></div>
+      <div class="label">Signal by Timeframe</div>
+      <div class="row tf-row"><span>5 min</span><strong id="signal5m">—</strong></div>
+      <div class="row tf-row"><span>15 min</span><strong id="signal15m">—</strong></div>
+      <div class="row tf-row"><span>1 hour</span><strong id="signal1h">—</strong></div>
+      <div class="row tf-row"><span>24 hour</span><strong id="signal24h">—</strong></div>
+      <div class="row" style="margin-top:6px;"><span>Strength</span><strong id="strength">—</strong></div>
     </section>
 
     <section class="card" id="assetCard">
@@ -68,6 +70,7 @@
     <footer class="footer">
       <span>Data as of:</span>
       <strong id="lastUpdate">—</strong>
+      <div class="poll-bar"><div id="pollProgress" class="poll-fill"></div></div>
     </footer>
 
     <script src="sidepanel.js"></script>

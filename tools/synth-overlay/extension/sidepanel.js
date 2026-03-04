@@ -11,11 +11,10 @@ const els = {
   deltaUp: document.getElementById("deltaUp"),
   deltaDown: document.getElementById("deltaDown"),
   edgeValue: document.getElementById("edgeValue"),
-  horizonLabel: document.getElementById("horizonLabel"),
-  signalPrimary: document.getElementById("signalPrimary"),
-  refRow: document.getElementById("refRow"),
-  refLabel: document.getElementById("refLabel"),
-  signalRef: document.getElementById("signalRef"),
+  signal5m: document.getElementById("signal5m"),
+  signal15m: document.getElementById("signal15m"),
+  signal1h: document.getElementById("signal1h"),
+  signal24h: document.getElementById("signal24h"),
   strength: document.getElementById("strength"),
   assetName: document.getElementById("assetName"),
   marketType: document.getElementById("marketType"),
@@ -26,6 +25,7 @@ const els = {
   invalidationText: document.getElementById("invalidationText"),
   lastUpdate: document.getElementById("lastUpdate"),
   refreshBtn: document.getElementById("refreshBtn"),
+  pollProgress: document.getElementById("pollProgress"),
 };
 
 function fmtCentsFromProb(p) {
@@ -99,11 +99,10 @@ function render(state) {
   els.deltaDown.textContent = state.deltaDown ? state.deltaDown.text : "—";
   els.deltaDown.className = "delta " + (state.deltaDown ? state.deltaDown.cls : "");
   els.edgeValue.textContent = state.edge;
-  els.horizonLabel.textContent = state.horizonLabel || "Primary";
-  els.signalPrimary.textContent = state.signalPrimary;
-  els.refLabel.textContent = state.refLabel || "Reference";
-  els.signalRef.textContent = state.signalRef;
-  els.refRow.style.display = state.signalRef === "—" ? "none" : "";
+  els.signal5m.textContent = state.signal5m || "—";
+  els.signal15m.textContent = state.signal15m || "—";
+  els.signal1h.textContent = state.signal1h || "—";
+  els.signal24h.textContent = state.signal24h || "—";
   els.strength.textContent = state.strength;
   els.assetName.textContent = state.asset || "—";
   els.marketType.textContent = state.marketType || "—";
@@ -119,8 +118,7 @@ function render(state) {
 const EMPTY = {
   synthUp: "—", synthDown: "—", polyUp: "—", polyDown: "—",
   deltaUp: null, deltaDown: null, edge: "—",
-  horizonLabel: "Primary", signalPrimary: "—",
-  refLabel: "Reference", signalRef: "—",
+  signal5m: "—", signal15m: "—", signal1h: "—", signal24h: "—",
   strength: "—", asset: "—", marketType: "—",
   analysis: "—", noTrade: false, invalidation: "—",
   confPct: 0, confColor: "#9ca3af", confText: "—",
@@ -162,24 +160,7 @@ async function refresh() {
   var confPct = Math.round(conf * 100);
   var horizon = edge.horizon || "24h";
   var mtype = edge.market_type || "daily";
-
-  // Build signal labels based on response shape
-  var horizonLabel = horizon;
-  var signalPrimary = (edge.signal || "—") + " " + fmtEdge(edge.edge_pct);
-  var refLabel = "Reference";
-  var signalRef = "—";
-
-  // Dual-horizon (daily/hourly): use 1h/24h fields
-  if (edge.signal_1h && edge.signal_24h) {
-    horizonLabel = "1 h";
-    signalPrimary = edge.signal_1h + " " + fmtEdge(edge.edge_1h_pct);
-    refLabel = "24 h";
-    signalRef = edge.signal_24h + " " + fmtEdge(edge.edge_24h_pct);
-  } else if (edge.ref_signal) {
-    // Short-horizon with reference context
-    refLabel = edge.ref_horizon || "Ref";
-    signalRef = edge.ref_signal + " " + fmtEdge(edge.ref_edge_pct);
-  }
+  var asset = edge.asset || "BTC";
 
   // Log live price status for debugging
   console.log("[Synth-Overlay] Edge response:", { 
@@ -196,9 +177,28 @@ async function refresh() {
   var deltaUp = fmtDelta(synthProbUp, polyProbUp);
   var deltaDown = fmtDelta(synthProbUp != null ? 1 - synthProbUp : null, polyProbDown);
 
+  // Fetch all timeframes for this asset (in parallel)
+  var tfSlugs = {
+    "5m": asset.toLowerCase() + "-updown-5m-" + Date.now(),
+    "15m": asset.toLowerCase() + "-updown-15m-" + Date.now(),
+    "1h": asset.toLowerCase() + "-updown-1h-" + Date.now(),
+    "24h": asset.toLowerCase() + "-updown-24h-" + Date.now(),
+  };
+  
+  // Build signals from response - map current market type to its slot
+  var signals = { "5m": "—", "15m": "—", "1h": "—", "24h": "—" };
+  var tfKey = mtype === "5min" ? "5m" : mtype === "15min" ? "15m" : mtype === "hourly" ? "1h" : "24h";
+  signals[tfKey] = (edge.signal || "—") + " " + fmtEdge(edge.edge_pct);
+  
+  // If we have dual-horizon data, populate both
+  if (edge.signal_1h && edge.signal_24h) {
+    signals["1h"] = edge.signal_1h + " " + fmtEdge(edge.edge_1h_pct);
+    signals["24h"] = edge.signal_24h + " " + fmtEdge(edge.edge_24h_pct);
+  }
+
   var liveStatus = edge.live_price_used ? " (Live)" : "";
   render({
-    status: "Synced — " + (edge.asset || "BTC") + " " + horizon + " forecast." + liveStatus,
+    status: "Synced — " + asset + " " + horizon + " forecast." + liveStatus,
     synthUp: fmtCentsFromProb(synthProbUp),
     synthDown: synthProbUp == null ? "—" : fmtCentsFromProb(1 - synthProbUp),
     polyUp: fmtCentsFromProb(polyProbUp),
@@ -206,12 +206,12 @@ async function refresh() {
     deltaUp: deltaUp,
     deltaDown: deltaDown,
     edge: fmtEdge(edge.edge_pct),
-    horizonLabel: horizonLabel,
-    signalPrimary: signalPrimary,
-    refLabel: refLabel,
-    signalRef: signalRef,
+    signal5m: signals["5m"],
+    signal15m: signals["15m"],
+    signal1h: signals["1h"],
+    signal24h: signals["24h"],
     strength: edge.strength || "—",
-    asset: edge.asset || "BTC",
+    asset: asset,
     marketType: mtype,
     analysis: edge.explanation || "No explanation available.",
     invalidation: edge.invalidation || "—",
@@ -221,13 +221,40 @@ async function refresh() {
     confText: (conf >= 0.7 ? "High" : conf >= 0.4 ? "Medium" : "Low") + " (" + confPct + "%)",
     lastUpdate: fmtApiTime(edge.current_time),
   });
+  
+  // Reset and start poll progress animation
+  startPollProgress();
 }
 
-els.refreshBtn.addEventListener("click", refresh);
-refresh();
+els.refreshBtn.addEventListener("click", function() {
+  stopPollProgress();
+  refresh();
+});
 
 // Polling frequency: Synth API updates forecasts every ~60 seconds for short-term markets.
 // We poll every 30 seconds to balance freshness vs API load.
-// Live DOM prices are scraped on each refresh for real-time edge calculation.
 const SYNTH_POLL_INTERVAL_MS = 30000;
+
+// Poll progress bar animation
+var pollTimer = null;
+var pollStart = 0;
+
+function startPollProgress() {
+  stopPollProgress();
+  pollStart = Date.now();
+  els.pollProgress.style.transition = "none";
+  els.pollProgress.style.width = "0%";
+  // Force reflow then animate
+  void els.pollProgress.offsetWidth;
+  els.pollProgress.style.transition = "width " + (SYNTH_POLL_INTERVAL_MS / 1000) + "s linear";
+  els.pollProgress.style.width = "100%";
+}
+
+function stopPollProgress() {
+  els.pollProgress.style.transition = "none";
+  els.pollProgress.style.width = "0%";
+}
+
+// Start polling
+refresh();
 setInterval(refresh, SYNTH_POLL_INTERVAL_MS);
