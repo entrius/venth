@@ -1,33 +1,36 @@
 # Tide Chart
 
-> Interactive dashboard comparing 24-hour probability cones for 5 equities using Synth forecasting data.
+> Interactive Flask dashboard comparing probability cones for equities and crypto using Synth forecasting data.
 
 ## Overview
 
-Tide Chart overlays probabilistic price forecasts for SPY, NVDA, TSLA, AAPL, and GOOGL into a single comparison view. It normalizes all forecasts to percentage change, enabling direct comparison across different price levels, and generates a ranked summary table with key metrics.
+Tide Chart overlays probabilistic price forecasts into a single comparison view with an interactive web interface. It supports both equities (SPY, NVDA, TSLA, AAPL, GOOGL) on the 24h horizon and crypto/commodities (BTC, ETH, SOL, XAU) on both 1h and 24h horizons. All forecasts are normalized to percentage change for direct comparison across different price levels.
 
-The tool addresses three questions from the forecast data:
-- **Directional alignment** - Are all equities moving the same way?
-- **Relative magnitude** - Which equity has the widest expected range?
-- **Asymmetric skew** - Is the upside or downside tail larger, individually and relative to SPY?
+The tool provides:
+- **Probability cones** - Interactive Plotly chart with 5th-95th percentile bands
+- **Probability calculator** - Enter a target price to see the exact probability of an asset reaching it
+- **Variable time horizons** - Toggle between Intraday (1H) and Next Day (24H) views
+- **Live auto-refresh** - Manual refresh button and configurable 5-minute auto-refresh
+- **Ranked metrics table** - Sortable table with directional alignment, skew, and relative benchmarks
 
 ## How It Works
 
-1. Fetches `get_prediction_percentiles` and `get_volatility` for each of the 5 equities (24h horizon)
-2. Normalizes all 289 time steps from raw price to `% change = (percentile - current_price) / current_price * 100`
-3. Computes metrics from the final time step (end of 24h window):
+1. Starts a Flask server serving the interactive dashboard at `http://localhost:5000`
+2. Fetches `get_prediction_percentiles` and `get_volatility` for assets in the selected horizon
+3. Normalizes time steps from raw price to `% change = (percentile - current_price) / current_price * 100`
+4. Computes metrics from the final time step (end of forecast window):
    - **Median Move** - 50th percentile % change
    - **Upside/Downside** - 95th and 5th percentile distances
    - **Directional Skew** - upside minus downside (positive = bullish asymmetry)
    - **Range** - total 5th-to-95th percentile width
-   - **Relative to SPY** - each metric minus SPY's value
-4. Ranks equities by median expected move (table columns are sortable by click)
-5. Generates an interactive Plotly HTML dashboard and opens it in the browser
+   - **Relative to Benchmark** - each metric minus benchmark (SPY for equities, BTC for crypto)
+5. Ranks assets by median expected move (table columns are sortable by click)
+6. Probability calculator uses linear interpolation across 9 percentile levels to estimate P(price <= target)
 
 ## Synth Endpoints Used
 
-- `get_prediction_percentiles(asset, horizon="24h")` - Provides 289 time-step probabilistic forecast with 9 percentile levels (0.5% to 99.5%). Used for the probability cone overlay and all derived metrics.
-- `get_volatility(asset, horizon="24h")` - Provides forecasted average volatility. Displayed in the ranking table as an independent risk measure.
+- `get_prediction_percentiles(asset, horizon)` - Provides time-step probabilistic forecast with 9 percentile levels (0.5% to 99.5%). Used for probability cones, metrics, and the probability calculator.
+- `get_volatility(asset, horizon)` - Provides forecasted average volatility. Displayed in the ranking table as an independent risk measure.
 
 ## Usage
 
@@ -35,25 +38,27 @@ The tool addresses three questions from the forecast data:
 # Install dependencies
 pip install -r requirements.txt
 
-# Run the tool (opens dashboard in browser)
+# Run the dashboard server (opens browser automatically)
 python main.py
+
+# Custom port
+TIDE_CHART_PORT=8080 python main.py
 
 # Run tests
 python -m pytest tests/ -v
 ```
 
-## Example Output
+## API Endpoints
 
-The dashboard contains two sections:
-
-**Probability Cone Comparison** - Interactive Plotly chart with semi-transparent bands (5th-95th percentile) and median lines for each equity. Hover to see exact values at any time step.
-
-**Equity Rankings** - Sortable table showing price, median move (% and $), forecasted volatility, directional skew (% and $), probability range (% and $), median vs SPY, and skew vs SPY. Click any column header to re-sort. Values are color-coded green (positive) or red (negative), with nominal dollar amounts shown alongside percentages for immediate context.
+- `GET /` - Serves the interactive dashboard HTML
+- `GET /api/data?horizon=24h` - Returns chart traces, table rows, and insights as JSON
+- `POST /api/probability` - Calculates target price probability (body: `{"asset": "SPY", "target_price": 600, "horizon": "24h"}`)
 
 ## Technical Details
 
 - **Language:** Python 3.10+
-- **Dependencies:** plotly (for chart generation)
-- **Synth Assets Used:** SPY, NVDA, TSLA, AAPL, GOOGL
-- **Output:** Single HTML file (requires internet for Plotly CDN and fonts; no server needed)
+- **Dependencies:** plotly, flask
+- **Equities (24h only):** SPY, NVDA, TSLA, AAPL, GOOGL
+- **Crypto + Commodities (1h & 24h):** BTC, ETH, SOL, XAU
+- **Output:** Flask web server with Plotly CDN (requires internet for fonts/plotly)
 - **Mock Mode:** Works without API key using bundled mock data

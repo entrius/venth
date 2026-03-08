@@ -1,9 +1,9 @@
 """
 Data processing module for the Tide Chart dashboard.
 
-Fetches prediction percentiles and volatility for 5 equities,
+Fetches prediction percentiles and volatility for supported assets,
 normalizes to percentage change, calculates comparison metrics,
-and ranks equities by forecast outlook.
+ranks assets by forecast outlook, and computes target price probabilities.
 """
 
 import sys
@@ -11,22 +11,42 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
-from synth_client import SynthClient
-
 EQUITIES = ["SPY", "NVDA", "TSLA", "AAPL", "GOOGL"]
+CRYPTO_ASSETS = ["BTC", "ETH", "SOL", "XAU"]
 PERCENTILE_KEYS = ["0.005", "0.05", "0.2", "0.35", "0.5", "0.65", "0.8", "0.95", "0.995"]
+PERCENTILE_LEVELS = [0.005, 0.05, 0.2, 0.35, 0.5, 0.65, 0.8, 0.95, 0.995]
 
 
-def fetch_all_data(client):
-    """Fetch prediction percentiles and volatility for all 5 equities.
+ALL_ASSETS = EQUITIES + CRYPTO_ASSETS
+
+
+def get_assets_for_horizon(horizon: str) -> list[str]:
+    """Return the list of supported assets for a given time horizon.
+
+    Equities (SPY, NVDA, TSLA, AAPL, GOOGL) only support 24h.
+    Crypto + XAU (BTC, ETH, SOL, XAU) support both 1h and 24h.
+    The 24h horizon includes all assets.
+    """
+    if horizon == "1h":
+        return list(CRYPTO_ASSETS)
+    return list(ALL_ASSETS)
+
+
+def fetch_all_data(client, horizon: str = "24h") -> dict:
+    """Fetch prediction percentiles and volatility for all assets in a horizon.
+
+    Args:
+        client: SynthClient instance.
+        horizon: "1h" or "24h".
 
     Returns:
         dict: {asset: {"percentiles": ..., "volatility": ..., "current_price": float}}
     """
+    assets = get_assets_for_horizon(horizon)
     data = {}
-    for asset in EQUITIES:
-        forecast = client.get_prediction_percentiles(asset, horizon="24h")
-        vol = client.get_volatility(asset, horizon="24h")
+    for asset in assets:
+        forecast = client.get_prediction_percentiles(asset, horizon=horizon)
+        vol = client.get_volatility(asset, horizon=horizon)
         data[asset] = {
             "current_price": forecast["current_price"],
             "percentiles": forecast["forecast_future"]["percentiles"],
@@ -56,9 +76,9 @@ def normalize_percentiles(percentiles, current_price):
 
 
 def calculate_metrics(data):
-    """Calculate comparison metrics for each equity.
+    """Calculate comparison metrics for each asset.
 
-    Uses the final time step (end of 24h window) for metric computation.
+    Uses the final time step (end of forecast window) for metric computation.
 
     Args:
         data: Dict from fetch_all_data().
@@ -102,20 +122,30 @@ def calculate_metrics(data):
     return metrics
 
 
-def add_relative_to_spy(metrics):
-    """Add relative-to-SPY fields for each equity.
+def add_relative_to_benchmark(metrics) -> dict:
+    """Add relative-to-benchmark fields for each asset.
+
+    Uses SPY as benchmark for equities, BTC for crypto assets.
 
     Args:
         metrics: Dict from calculate_metrics().
 
     Returns:
-        Same dict with added relative_median and relative_skew fields.
+        Same dict with added relative_median, relative_skew, and benchmark fields.
     """
-    spy = metrics["SPY"]
+    assets = list(metrics.keys())
+    benchmark = "SPY" if "SPY" in metrics else assets[0]
+    bench_m = metrics[benchmark]
     for asset, m in metrics.items():
-        m["relative_median"] = m["median_move"] - spy["median_move"]
-        m["relative_skew"] = m["skew"] - spy["skew"]
-    return metrics
+        m["relative_median"] = m["median_move"] - bench_m["median_move"]
+        m["relative_skew"] = m["skew"] - bench_m["skew"]
+    return metrics, benchmark
+
+
+def add_relative_to_spy(metrics):
+    """Add relative-to-SPY fields for each equity (legacy wrapper)."""
+    result, _ = add_relative_to_benchmark(metrics)
+    return result
 
 
 def rank_equities(metrics, sort_by="median_move", ascending=False):
@@ -135,7 +165,7 @@ def rank_equities(metrics, sort_by="median_move", ascending=False):
 
 
 def get_normalized_series(data):
-    """Get full normalized time series for all equities (for charting).
+    """Get full normalized time series for all assets (for charting).
 
     Args:
         data: Dict from fetch_all_data().
@@ -149,3 +179,41 @@ def get_normalized_series(data):
             info["percentiles"], info["current_price"]
         )
     return series
+
+
+def calculate_target_probability(percentiles: list[dict], target_price: float) -> float:
+    """Calculate the probability of an asset reaching a target price.
+
+    Uses the final time step's percentile distribution and linear interpolation
+    to estimate P(price <= target). Returns the probability as a percentage (0-100).
+
+    Args:
+        percentiles: List of percentile dicts (time steps). Uses the final step.
+        target_price: The target price to evaluate.
+
+    Returns:
+        float: Probability (0-100) that the price will be at or below the target.
+    """
+    final_step = percentiles[-1]
+    prices = [final_step[k] for k in PERCENTILE_KEYS]
+    levels = PERCENTILE_LEVELS
+
+    # Target below the lowest percentile
+    if target_price <= prices[0]:
+        return levels[0] * 100
+
+    # Target above the highest percentile
+    if target_price >= prices[-1]:
+        return levels[-1] * 100
+
+    # Linear interpolation between bracketing percentiles
+    for i in range(len(prices) - 1):
+        if prices[i] <= target_price <= prices[i + 1]:
+            price_range = prices[i + 1] - prices[i]
+            if price_range == 0:
+                return levels[i] * 100
+            fraction = (target_price - prices[i]) / price_range
+            prob = levels[i] + fraction * (levels[i + 1] - levels[i])
+            return prob * 100
+
+    return 50.0
