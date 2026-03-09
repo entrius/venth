@@ -13,7 +13,7 @@ The tool provides:
 - **Live auto-refresh** - Manual refresh button and configurable 5-minute auto-refresh
 - **Ranked metrics table** - Sortable table with directional alignment, skew, and relative benchmarks
 - **Wallet connection** - Connect MetaMask to trade directly from the dashboard
-- **gTrade integration** - Open leveraged long/short positions on equities (SPY, NVDA, TSLA, AAPL, GOOGL) via Gains Network on Arbitrum
+- **gTrade integration** - Open leveraged long/short positions on all supported assets (crypto, equities, commodities) via Gains Network on Arbitrum with per-asset-class leverage guards
 
 ## How It Works
 
@@ -72,8 +72,8 @@ Tide Chart includes built-in wallet connection and trading via gTrade (Gains Net
 
 1. Click **Connect Wallet** in the top-right header
 2. Approve the MetaMask connection (auto-switches to Arbitrum if needed)
-3. Click **Trade** on any equity row in the rankings table (SPY, NVDA, TSLA, AAPL, GOOGL)
-4. Choose direction (Long/Short), set collateral, leverage (2-150x), and optional TP/SL
+3. Click **Trade** on any asset row in the rankings table
+4. Choose direction (Long/Short), set collateral, leverage (auto-adjusted per asset class), and optional TP/SL
 5. Click the submit button to open the position via gTrade smart contracts
 6. The dashboard handles USDC approval automatically on first trade
 
@@ -82,10 +82,23 @@ Tide Chart includes built-in wallet connection and trading via gTrade (Gains Net
 | Parameter | Range | Notes |
 |-----------|-------|-------|
 | Collateral | USDC amount | Minimum position size: $1,500 (collateral x leverage) |
-| Leverage | 2x - 150x | Higher leverage = higher risk |
+| Leverage | Per asset class | Crypto: 1.1x-500x, Stocks/Indices: 1.1x-50x, Commodities: 2x-250x |
 | Max Slippage | 0.1% - 5% | Default: 1% |
 | Take Profit | Optional % | Auto-closes at profit target |
 | Stop Loss | Optional % | Auto-closes at loss limit |
+
+### Per-Asset-Class Leverage Limits
+
+The UI enforces gTrade's per-asset-class leverage constraints to prevent on-chain reverts:
+
+| Asset Class | Assets | Leverage Range |
+|-------------|--------|----------------|
+| Crypto | BTC, ETH, SOL | 1.1x - 500x |
+| Stocks | NVDA, TSLA, AAPL, GOOGL | 1.1x - 50x |
+| Indices | SPY | 1.1x - 50x |
+| Commodities | XAU | 2x - 250x |
+
+The leverage slider automatically adjusts its range when you select an asset to trade.
 
 ### Security
 
@@ -100,6 +113,6 @@ Tide Chart includes built-in wallet connection and trading via gTrade (Gains Net
 - **Frontend CDN:** Plotly, ethers.js v6
 - **Equities (24h only):** SPY, NVDA, TSLA, AAPL, GOOGL
 - **Crypto + Commodities (1h & 24h):** BTC, ETH, SOL, XAU
-- **Trading:** gTrade (Gains Network) on Arbitrum via GNSMultiCollatDiamond contract
+- **Trading:** gTrade (Gains Network) on Arbitrum via GNSMultiCollatDiamond contract (all 9 assets with per-group leverage guards)
 - **Output:** Flask web server with Plotly CDN (requires internet for fonts/plotly/ethers)
 - **Mock Mode:** Works without API key using bundled mock data (trading requires a real wallet)

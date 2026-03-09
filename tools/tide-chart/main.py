@@ -20,6 +20,8 @@ from flask import Flask, jsonify, request, Response
 from synth_client import SynthClient
 from chart import (
     EQUITIES,
+    CRYPTO_ASSETS,
+    ALL_ASSETS,
     fetch_all_data,
     calculate_metrics,
     add_relative_to_benchmark,
@@ -29,7 +31,21 @@ from chart import (
     get_assets_for_horizon,
 )
 
-TRADEABLE_ASSETS = set(EQUITIES)
+# Per-asset-group gTrade leverage constraints (from gTrade docs)
+ASSET_GROUPS = {
+    "crypto":      {"min_leverage": 1.1, "max_leverage": 500, "assets": ["BTC", "ETH", "SOL"]},
+    "stocks":      {"min_leverage": 1.1, "max_leverage": 50,  "assets": ["NVDA", "TSLA", "AAPL", "GOOGL"]},
+    "indices":     {"min_leverage": 1.1, "max_leverage": 50,  "assets": ["SPY"]},
+    "commodities": {"min_leverage": 2,   "max_leverage": 250, "assets": ["XAU"]},
+}
+
+# Build asset -> group lookup
+ASSET_TO_GROUP = {}
+for _group_name, _group_info in ASSET_GROUPS.items():
+    for _a in _group_info["assets"]:
+        ASSET_TO_GROUP[_a] = _group_name
+
+TRADEABLE_ASSETS = set(ALL_ASSETS)
 
 # gTrade (Gains Network) configuration — server-side source of truth
 GTRADE_CONFIG = {
@@ -38,29 +54,51 @@ GTRADE_CONFIG = {
     "usdc_address": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
     "usdc_decimals": 6,
     "collateral_index": 3,
-    "pair_indices": {"SPY": 86, "NVDA": 65, "TSLA": 85, "AAPL": 58, "GOOGL": 82},
+    "pair_indices": {
+        "BTC": 0, "ETH": 1, "SOL": 33,
+        "SPY": 86, "NVDA": 65, "TSLA": 85, "AAPL": 58, "GOOGL": 82,
+        "XAU": 90,
+    },
+    "asset_groups": {
+        group_name: {"min_leverage": info["min_leverage"], "max_leverage": info["max_leverage"], "assets": info["assets"]}
+        for group_name, info in ASSET_GROUPS.items()
+    },
     "min_position_size_usd": 1500,
-    "min_leverage": 2,
-    "max_leverage": 150,
     "gtrade_app_url": "https://gains.trade/trading",
 }
 
 
+def get_asset_leverage_limits(asset: str) -> tuple[float, float]:
+    """Return (min_leverage, max_leverage) for an asset based on its group."""
+    group = ASSET_TO_GROUP.get(asset)
+    if group and group in ASSET_GROUPS:
+        g = ASSET_GROUPS[group]
+        return g["min_leverage"], g["max_leverage"]
+    return 1.1, 50  # safe default
+
+
 def validate_trade_params(params: dict) -> list[str]:
-    """Validate trade parameters server-side. Returns list of error strings."""
-    errors, cfg = [], GTRADE_CONFIG
-    asset, collateral, leverage = params.get("asset", ""), params.get("collateral", 0), params.get("leverage", 0)
-    if asset not in cfg["pair_indices"]:
+    """Validate trade parameters server-side with per-group leverage limits."""
+    errors = []
+    asset = params.get("asset", "")
+    collateral = params.get("collateral", 0)
+    leverage = params.get("leverage", 0)
+
+    if asset not in GTRADE_CONFIG["pair_indices"]:
         errors.append(f"Asset '{asset}' is not supported for trading.")
     if not isinstance(collateral, (int, float)) or collateral <= 0:
         errors.append("Collateral must be a positive number.")
     if not isinstance(leverage, (int, float)):
         errors.append("Leverage must be a number.")
-    elif leverage < cfg["min_leverage"] or leverage > cfg["max_leverage"]:
-        errors.append(f"Leverage must be between {cfg['min_leverage']}x and {cfg['max_leverage']}x.")
-    if isinstance(collateral, (int, float)) and isinstance(leverage, (int, float)) and collateral > 0:
-        if collateral * leverage < cfg["min_position_size_usd"]:
-            errors.append(f"Position size ${collateral * leverage:,.2f} is below minimum ${cfg['min_position_size_usd']:,}.")
+    elif asset in ASSET_TO_GROUP:
+        min_lev, max_lev = get_asset_leverage_limits(asset)
+        if leverage < min_lev or leverage > max_lev:
+            group = ASSET_TO_GROUP[asset]
+            errors.append(f"Leverage must be between {min_lev}x and {max_lev}x for {group} assets.")
+    if isinstance(collateral, (int, float)) and isinstance(leverage, (int, float)) and collateral > 0 and leverage > 0:
+        position_size = collateral * leverage
+        if position_size < GTRADE_CONFIG["min_position_size_usd"]:
+            errors.append(f"Position size ${position_size:,.2f} is below minimum ${GTRADE_CONFIG['min_position_size_usd']:,}.")
     slippage = params.get("slippage", 1.0)
     if isinstance(slippage, (int, float)) and (slippage < 0.1 or slippage > 5.0):
         errors.append("Slippage must be between 0.1% and 5.0%.")
@@ -724,11 +762,11 @@ def generate_dashboard_html(client) -> str:
         '            <input type="number" id="trade-slippage" step="0.1" min="0.1" max="5" value="1.0">\n'
         '          </div>\n'
         '          <div class="trade-field full-width">\n'
-        '            <label>Leverage <span class="hint">2x - 150x</span></label>\n'
+        '            <label>Leverage <span class="hint" id="trade-leverage-hint">1.1x - 50x</span></label>\n'
         '            <div class="trade-leverage-display" id="trade-leverage-display">15x</div>\n'
-        '            <input type="range" class="trade-slider" id="trade-leverage" min="2" max="150" value="15" step="1">\n'
-        '            <div class="trade-slider-labels">\n'
-        '              <span>2x</span><span>50x</span><span>100x</span><span>150x</span>\n'
+        '            <input type="range" class="trade-slider" id="trade-leverage" min="2" max="50" value="15" step="1">\n'
+        '            <div class="trade-slider-labels" id="trade-slider-labels">\n'
+        '              <span id="trade-lev-min">2x</span><span id="trade-lev-max">50x</span>\n'
         '            </div>\n'
         '          </div>\n'
         '          <div class="trade-field">\n'
@@ -967,11 +1005,23 @@ def generate_dashboard_html(client) -> str:
         "  usdcAddress: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831',\n"
         "  usdcDecimals: 6,\n"
         "  collateralIndex: 3,\n"
-        "  pairIndices: { SPY: 86, NVDA: 65, TSLA: 85, AAPL: 58, GOOGL: 82 },\n"
+        "  pairIndices: { BTC: 0, ETH: 1, SOL: 33, SPY: 86, NVDA: 65, TSLA: 85, AAPL: 58, GOOGL: 82, XAU: 90 },\n"
         "  minPositionSizeUsd: 1500,\n"
-        "  maxLeverage: 150,\n"
-        "  minLeverage: 2\n"
+        "  assetGroups: {\n"
+        "    crypto:      { minLeverage: 1.1, maxLeverage: 500, assets: ['BTC', 'ETH', 'SOL'] },\n"
+        "    stocks:      { minLeverage: 1.1, maxLeverage: 50,  assets: ['NVDA', 'TSLA', 'AAPL', 'GOOGL'] },\n"
+        "    indices:     { minLeverage: 1.1, maxLeverage: 50,  assets: ['SPY'] },\n"
+        "    commodities: { minLeverage: 2,   maxLeverage: 250, assets: ['XAU'] }\n"
+        "  }\n"
         "};\n"
+        "\n"
+        "function getAssetLimits(asset) {\n"
+        "  var groups = GTRADE_CONFIG.assetGroups;\n"
+        "  for (var g in groups) {\n"
+        "    if (groups[g].assets.indexOf(asset) !== -1) return groups[g];\n"
+        "  }\n"
+        "  return { minLeverage: 1.1, maxLeverage: 50 };\n"
+        "}\n"
         "\n"
         "var DIAMOND_ABI = [\n"
         "  'function openTrade((address user, uint32 index, uint16 pairIndex, uint24 leverage, bool long, bool isOpen, uint8 collateralIndex, uint8 tradeType, uint120 collateralAmount, uint64 openPrice, uint64 tp, uint64 sl, uint192 __placeholder) _trade, uint16 _maxSlippageP, address _referrer)'\n"
@@ -1142,6 +1192,12 @@ def generate_dashboard_html(client) -> str:
         "  var positionSize = collateral * leverage;\n"
         "  var errs = [];\n"
         "  if (collateral <= 0) errs.push('Enter collateral amount');\n"
+        "  if (currentTradeAsset) {\n"
+        "    var limits = getAssetLimits(currentTradeAsset);\n"
+        "    if (leverage < limits.minLeverage || leverage > limits.maxLeverage) {\n"
+        "      errs.push('Leverage must be ' + limits.minLeverage + 'x - ' + limits.maxLeverage + 'x for ' + currentTradeAsset);\n"
+        "    }\n"
+        "  }\n"
         "  if (positionSize < GTRADE_CONFIG.minPositionSizeUsd && collateral > 0) {\n"
         "    errs.push('Min position size: $' + GTRADE_CONFIG.minPositionSizeUsd.toLocaleString());\n"
         "  }\n"
@@ -1269,15 +1325,27 @@ def generate_dashboard_html(client) -> str:
         "var currentTradeAsset = null;\n"
         "\n"
         "function openTradePanel(asset) {\n"
-        "  if (!GTRADE_CONFIG.pairIndices[asset]) return;\n"
+        "  if (GTRADE_CONFIG.pairIndices[asset] === undefined) return;\n"
         "  currentTradeAsset = asset;\n"
         "  document.getElementById('trade-asset-label').textContent = asset;\n"
         "  document.getElementById('trade-panel').classList.add('visible');\n"
         "\n"
+        "  // Set leverage slider limits based on asset group\n"
+        "  var limits = getAssetLimits(asset);\n"
+        "  var slider = document.getElementById('trade-leverage');\n"
+        "  var minLev = Math.ceil(limits.minLeverage);\n"
+        "  var maxLev = Math.floor(limits.maxLeverage);\n"
+        "  slider.min = minLev;\n"
+        "  slider.max = maxLev;\n"
+        "  var defaultLev = Math.min(15, maxLev);\n"
+        "  slider.value = defaultLev;\n"
+        "  document.getElementById('trade-leverage-display').textContent = defaultLev + 'x';\n"
+        "  document.getElementById('trade-leverage-hint').textContent = minLev + 'x - ' + maxLev + 'x';\n"
+        "  document.getElementById('trade-lev-min').textContent = minLev + 'x';\n"
+        "  document.getElementById('trade-lev-max').textContent = maxLev + 'x';\n"
+        "\n"
         "  // Reset form fields\n"
         "  document.getElementById('trade-collateral').value = '';\n"
-        "  document.getElementById('trade-leverage').value = 15;\n"
-        "  document.getElementById('trade-leverage-display').textContent = '15x';\n"
         "  document.getElementById('trade-tp').value = '';\n"
         "  document.getElementById('trade-sl').value = '';\n"
         "  document.getElementById('trade-slippage').value = '1.0';\n"

@@ -36,7 +36,8 @@ from chart import (
 )
 from main import (
     generate_dashboard_html, create_app, build_insights, make_time_points,
-    validate_trade_params, GTRADE_CONFIG, TRADEABLE_ASSETS,
+    validate_trade_params, GTRADE_CONFIG, TRADEABLE_ASSETS, ASSET_GROUPS,
+    get_asset_leverage_limits,
 )
 
 
@@ -546,20 +547,12 @@ def test_dashboard_has_ethers_cdn():
     assert "ethers" in html
 
 
-def test_dashboard_has_trade_buttons_for_equities():
-    """Verify trade buttons appear for all equity assets."""
+def test_dashboard_has_trade_buttons_for_all_assets():
+    """Verify trade buttons appear for all supported assets."""
     client = _make_client()
     html = generate_dashboard_html(client)
-    for eq in ["SPY", "NVDA", "TSLA", "AAPL", "GOOGL"]:
-        assert f'data-asset="{eq}"' in html
-
-
-def test_dashboard_no_trade_buttons_for_crypto():
-    """Verify trade buttons do NOT appear for crypto/commodity assets."""
-    client = _make_client()
-    html = generate_dashboard_html(client)
-    for cr in ["BTC", "ETH", "SOL", "XAU"]:
-        assert f'data-asset="{cr}"' not in html
+    for asset in ["BTC", "ETH", "SOL", "XAU", "SPY", "NVDA", "TSLA", "AAPL", "GOOGL"]:
+        assert f'data-asset="{asset}"' in html
 
 
 def test_dashboard_has_toast_container():
@@ -603,7 +596,7 @@ def test_dashboard_has_trade_execution():
 
 
 def test_table_rows_have_trade_column():
-    """Verify table rows include trade button cells."""
+    """Verify table rows include trade button cells for all assets."""
     client = _make_client()
     app = create_app(client)
     with app.test_client() as tc:
@@ -611,7 +604,7 @@ def test_table_rows_have_trade_column():
         data = json.loads(resp.data)
         assert 'trade-cell-btn' in data["table_rows"]
         assert 'data-asset="SPY"' in data["table_rows"]
-        assert 'trade-cell-na' in data["table_rows"]
+        assert 'data-asset="BTC"' in data["table_rows"]
 
 
 # --- Tests for server-side trade validation and config ---
@@ -625,7 +618,7 @@ def test_validate_trade_params_valid():
 
 def test_validate_trade_params_invalid_asset():
     """Verify unsupported asset is rejected."""
-    errors = validate_trade_params({"asset": "BTC", "collateral": 100, "leverage": 15})
+    errors = validate_trade_params({"asset": "DOGE", "collateral": 100, "leverage": 15})
     assert any("not supported" in e for e in errors)
 
 
@@ -636,12 +629,28 @@ def test_validate_trade_params_below_min_position():
 
 
 def test_validate_trade_params_leverage_out_of_range():
-    """Verify leverage outside allowed range is rejected."""
-    errors_high = validate_trade_params({"asset": "SPY", "collateral": 1000, "leverage": 200})
+    """Verify leverage outside allowed range is rejected per asset group."""
+    # SPY is an index — max 50x
+    errors_high = validate_trade_params({"asset": "SPY", "collateral": 1000, "leverage": 51})
     assert any("Leverage" in e for e in errors_high)
 
     errors_low = validate_trade_params({"asset": "SPY", "collateral": 1000, "leverage": 1})
     assert any("Leverage" in e for e in errors_low)
+
+    # BTC is crypto — max 500x, so 200x should be valid
+    errors_btc = validate_trade_params({"asset": "BTC", "collateral": 100, "leverage": 200})
+    assert errors_btc == []
+
+    # NVDA is stocks — max 50x
+    errors_nvda = validate_trade_params({"asset": "NVDA", "collateral": 1000, "leverage": 51})
+    assert any("Leverage" in e for e in errors_nvda)
+
+    # XAU is commodities — min 2x, max 250x
+    errors_xau_low = validate_trade_params({"asset": "XAU", "collateral": 1000, "leverage": 1.5})
+    assert any("Leverage" in e for e in errors_xau_low)
+
+    errors_xau_ok = validate_trade_params({"asset": "XAU", "collateral": 100, "leverage": 100})
+    assert errors_xau_ok == []
 
 
 def test_validate_trade_params_bad_collateral():
@@ -657,7 +666,7 @@ def test_validate_trade_params_bad_slippage():
 
 
 def test_flask_api_gtrade_config():
-    """Verify /api/gtrade/config returns correct configuration."""
+    """Verify /api/gtrade/config returns correct configuration with asset groups."""
     client = _make_client()
     app = create_app(client)
     with app.test_client() as tc:
@@ -665,8 +674,13 @@ def test_flask_api_gtrade_config():
         cfg = json.loads(resp.data)
         assert cfg["chain_id"] == 42161
         assert cfg["pair_indices"]["SPY"] == 86
+        assert cfg["pair_indices"]["BTC"] == 0
+        assert cfg["pair_indices"]["XAU"] == 90
         assert "diamond_address" in cfg
         assert "gtrade_app_url" in cfg
+        assert cfg["asset_groups"]["crypto"]["max_leverage"] == 500
+        assert cfg["asset_groups"]["stocks"]["max_leverage"] == 50
+        assert cfg["asset_groups"]["commodities"]["max_leverage"] == 250
 
 
 def test_flask_api_gtrade_validate_valid():
@@ -690,20 +704,48 @@ def test_flask_api_gtrade_validate_invalid():
     client = _make_client()
     app = create_app(client)
     with app.test_client() as tc:
+        # DOGE is unsupported, collateral 5 with leverage 200 is below min position
         resp = tc.post(
             "/api/gtrade/validate-trade",
-            data=json.dumps({"asset": "BTC", "collateral": 5, "leverage": 200}),
+            data=json.dumps({"asset": "DOGE", "collateral": 5, "leverage": 200}),
             content_type="application/json",
         )
         assert resp.status_code == 400
         data = json.loads(resp.data)
         assert data["valid"] is False
-        assert len(data["errors"]) >= 2
+        assert len(data["errors"]) >= 1
 
 
 def test_gtrade_config_matches_tradeable_assets():
-    """Verify GTRADE_CONFIG pair indices match TRADEABLE_ASSETS."""
+    """Verify GTRADE_CONFIG pair indices and asset groups both cover TRADEABLE_ASSETS."""
     assert set(GTRADE_CONFIG["pair_indices"].keys()) == TRADEABLE_ASSETS
+    grouped = set()
+    for info in ASSET_GROUPS.values():
+        grouped.update(info["assets"])
+    assert grouped == TRADEABLE_ASSETS
+
+
+def test_get_asset_leverage_limits():
+    """Verify per-group leverage limits are returned correctly."""
+    assert get_asset_leverage_limits("BTC") == (1.1, 500)
+    assert get_asset_leverage_limits("ETH") == (1.1, 500)
+    assert get_asset_leverage_limits("SOL") == (1.1, 500)
+    assert get_asset_leverage_limits("SPY") == (1.1, 50)
+    assert get_asset_leverage_limits("NVDA") == (1.1, 50)
+    assert get_asset_leverage_limits("XAU") == (2, 250)
+    # Unknown asset gets safe defaults
+    assert get_asset_leverage_limits("DOGE") == (1.1, 50)
+
+
+def test_dashboard_has_asset_groups_js():
+    """Verify dashboard JS includes per-group leverage constraints."""
+    client = _make_client()
+    html = generate_dashboard_html(client)
+    assert "assetGroups" in html
+    assert "getAssetLimits" in html
+    assert "maxLeverage: 500" in html
+    assert "maxLeverage: 50" in html
+    assert "maxLeverage: 250" in html
 
 
 def test_dashboard_has_gtrade_fallback_link():
@@ -761,8 +803,7 @@ if __name__ == "__main__":
     test_dashboard_has_wallet_button()
     test_dashboard_has_trade_panel()
     test_dashboard_has_ethers_cdn()
-    test_dashboard_has_trade_buttons_for_equities()
-    test_dashboard_no_trade_buttons_for_crypto()
+    test_dashboard_has_trade_buttons_for_all_assets()
     test_dashboard_has_toast_container()
     test_dashboard_has_gtrade_config()
     test_dashboard_has_wallet_manager()
@@ -778,6 +819,8 @@ if __name__ == "__main__":
     test_flask_api_gtrade_validate_valid()
     test_flask_api_gtrade_validate_invalid()
     test_gtrade_config_matches_tradeable_assets()
+    test_get_asset_leverage_limits()
+    test_dashboard_has_asset_groups_js()
     test_dashboard_has_gtrade_fallback_link()
     test_dashboard_calls_server_validation()
     print("All tests passed!")
