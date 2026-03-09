@@ -2,7 +2,7 @@
 
 const API_BASE = "http://127.0.0.1:8765";
 
-// Cache last Synth data for instant recalculation when live prices change
+// Cached data for instant recalculation when live prices change
 var cachedSynthData = null;
 var cachedMarketType = null;
 var currentSlug = null;
@@ -88,9 +88,14 @@ async function fetchEdge(slug, livePrices) {
   if (livePrices && livePrices.upPrice != null) {
     url += "&live_prob_up=" + encodeURIComponent(livePrices.upPrice);
   }
-  const res = await fetch(url);
-  if (!res.ok) return null;
-  return await res.json();
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (_e) {
+    console.log("[Synth-Overlay] API unreachable — is the server running?");
+    return null;
+  }
 }
 
 function render(state) {
@@ -223,14 +228,7 @@ async function refresh() {
   cachedMarketType = mtype;
   currentSlug = ctx.slug;
 
-  // Log live price status for debugging
-  console.log("[Synth-Overlay] Edge response:", { 
-    live_price_used: edge.live_price_used, 
-    polymarket_prob: edge.polymarket_probability_up,
-    livePricesFromDOM: ctx.livePrices 
-  });
-
-  // Get Polymarket price (from API response or live DOM)
+  // Get Polymarket price (prefer live DOM price over API response)
   var polyProbUp = ctx.livePrices ? ctx.livePrices.upPrice : edge.polymarket_probability_up;
   var polyProbDown = polyProbUp != null ? 1 - polyProbUp : null;
 
@@ -282,6 +280,9 @@ async function refresh() {
   
   // Reset and start poll progress animation
   startPollProgress();
+
+  // Update watch button state for alerts UI
+  updateWatchBtnState();
 }
 
 els.refreshBtn.addEventListener("click", function() {
@@ -289,11 +290,9 @@ els.refreshBtn.addEventListener("click", function() {
   refresh();
 });
 
-// Polling frequency: Synth API updates forecasts every ~60 seconds for short-term markets.
-// We poll every 30 seconds to balance freshness vs API load.
+// Poll the API every 30 seconds to stay reasonably fresh without hammering the server
 const SYNTH_POLL_INTERVAL_MS = 30000;
 
-// Poll progress bar animation
 var pollStart = 0;
 
 function startPollProgress() {
@@ -312,7 +311,7 @@ function stopPollProgress() {
   els.pollProgress.style.width = "0%";
 }
 
-// Listen for real-time price updates and URL changes from content script
+// Handle live price pushes and URL changes from the content script
 chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
   if (!message) return;
   if (message.type === "synth:priceUpdate") {
@@ -332,7 +331,7 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
   }
 });
 
-// Also detect tab URL changes (full navigations)
+// Full navigation (not SPA) triggers a fresh fetch
 chrome.tabs.onUpdated.addListener(function(tabId, changeInfo, tab) {
   if (changeInfo.url && tab.active && tab.url && tab.url.startsWith("https://polymarket.com/")) {
     console.log("[Synth-Overlay] Tab URL updated:", changeInfo.url);
@@ -345,7 +344,7 @@ chrome.tabs.onUpdated.addListener(function(tabId, changeInfo, tab) {
   }
 });
 
-// Fast price poll: pull live prices from content script every 1s (reliable fallback)
+// Poll live prices from content script every 1s as a reliable fallback
 var lastPollPrices = { upPrice: null, downPrice: null };
 setInterval(async function() {
   if (!cachedSynthData) return;
@@ -362,6 +361,91 @@ setInterval(async function() {
     }
   } catch (_e) {}
 }, 1000);
+
+// ---- Alerts UI ----
+// Toggle, threshold input, and watchlist management
+
+var alertEls = {
+  enabled: document.getElementById("alertsEnabled"),
+  body: document.getElementById("alertsBody"),
+  threshold: document.getElementById("alertThreshold"),
+  watchlist: document.getElementById("watchlist"),
+  watchBtn: document.getElementById("watchBtn"),
+};
+
+var MAX_WATCHLIST = 15;
+
+function renderWatchlist(list) {
+  alertEls.watchlist.innerHTML = "";
+  if (list.length === 0) {
+    var hint = document.createElement("div");
+    hint.className = "watch-empty";
+    hint.textContent = "No markets watched yet";
+    alertEls.watchlist.appendChild(hint);
+  }
+  list.forEach(function (item) {
+    var row = document.createElement("div");
+    row.className = "watch-item";
+    var label = document.createElement("span");
+    label.textContent = item.label || item.slug;
+    var btn = document.createElement("button");
+    btn.className = "watch-remove";
+    btn.textContent = "\u00d7";
+    btn.title = "Remove";
+    btn.addEventListener("click", function () {
+      SynthAlerts.removeFromWatchlist(item.slug, renderWatchlist);
+    });
+    row.appendChild(label);
+    row.appendChild(btn);
+    alertEls.watchlist.appendChild(row);
+  });
+  updateWatchBtnState();
+}
+
+function updateWatchBtnState() {
+  if (!currentSlug) {
+    alertEls.watchBtn.disabled = true;
+    alertEls.watchBtn.textContent = "No market loaded";
+    return;
+  }
+  SynthAlerts.load(function (settings) {
+    var watching = settings.watchlist.some(function (w) { return w.slug === currentSlug; });
+    alertEls.watchBtn.disabled = watching;
+    alertEls.watchBtn.textContent = watching ? "Already watching" : "+ Watch this market";
+  });
+}
+
+// Initialize alerts UI from saved settings
+SynthAlerts.load(function (settings) {
+  alertEls.enabled.checked = settings.enabled;
+  alertEls.body.classList.toggle("hidden", !settings.enabled);
+  alertEls.threshold.value = settings.threshold;
+  renderWatchlist(settings.watchlist);
+});
+
+alertEls.enabled.addEventListener("change", function () {
+  var on = alertEls.enabled.checked;
+  SynthAlerts.saveEnabled(on);
+  alertEls.body.classList.toggle("hidden", !on);
+});
+
+alertEls.threshold.addEventListener("change", function () {
+  SynthAlerts.saveThreshold(alertEls.threshold.value);
+});
+
+alertEls.watchBtn.addEventListener("click", function () {
+  if (!currentSlug) return;
+  SynthAlerts.load(function (settings) {
+    if (settings.watchlist.length >= MAX_WATCHLIST) {
+      alertEls.watchBtn.textContent = "Watchlist full (" + MAX_WATCHLIST + " max)";
+      return;
+    }
+    var asset = cachedSynthData ? (cachedSynthData.asset || "BTC") : "BTC";
+    var mtype = cachedMarketType || "daily";
+    var label = SynthAlerts.formatLabel(asset, mtype);
+    SynthAlerts.addToWatchlist(currentSlug, asset, label, renderWatchlist);
+  });
+});
 
 // Start polling
 refresh();

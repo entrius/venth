@@ -187,3 +187,154 @@ button {
   background: #3b82f6;
   transition: width 1s linear;
 }
+
+/* Alerts section */
+.alerts-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 6px;
+}
+
+.alerts-body {
+  margin-top: 6px;
+}
+
+.alerts-field {
+  margin-bottom: 8px;
+}
+
+.alerts-field label {
+  display: block;
+  font-size: 12px;
+  color: #374151;
+  margin-bottom: 4px;
+}
+
+.threshold-input {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.threshold-input input {
+  width: 64px;
+  padding: 4px 6px;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  font-size: 13px;
+  background: #f9fafb;
+}
+
+.threshold-input .unit {
+  font-size: 12px;
+  color: #6b7280;
+}
+
+/* Toggle switch */
+.toggle {
+  position: relative;
+  display: inline-block;
+  width: 36px;
+  height: 20px;
+}
+
+.toggle input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.toggle-slider {
+  position: absolute;
+  inset: 0;
+  background: #d1d5db;
+  border-radius: 20px;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.toggle-slider::before {
+  content: "";
+  position: absolute;
+  width: 16px;
+  height: 16px;
+  left: 2px;
+  bottom: 2px;
+  background: #fff;
+  border-radius: 50%;
+  transition: transform 0.2s;
+}
+
+.toggle input:checked + .toggle-slider {
+  background: #3b82f6;
+}
+
+.toggle input:checked + .toggle-slider::before {
+  transform: translateX(16px);
+}
+
+/* Watchlist */
+.watchlist {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 6px;
+}
+
+.watch-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 8px;
+  background: #f3f4f6;
+  border-radius: 6px;
+  font-size: 12px;
+}
+
+.watch-item span {
+  color: #374151;
+}
+
+.watch-remove {
+  background: none;
+  border: none;
+  color: #9ca3af;
+  cursor: pointer;
+  font-size: 14px;
+  padding: 0 2px;
+  line-height: 1;
+}
+
+.watch-remove:hover {
+  color: #ef4444;
+}
+
+.watch-empty {
+  font-size: 12px;
+  color: #9ca3af;
+  font-style: italic;
+  padding: 4px 0;
+}
+
+.watch-btn {
+  width: 100%;
+  font-size: 12px;
+  padding: 5px 8px;
+  color: #3b82f6;
+  border: 1px dashed #93c5fd;
+  background: #eff6ff;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.watch-btn:hover:not(:disabled) {
+  background: #dbeafe;
+}
+
+.watch-btn:disabled {
+  color: #9ca3af;
+  border-color: #d1d5db;
+  background: #f9fafb;
+  cursor: default;
+}
