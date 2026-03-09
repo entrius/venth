@@ -55,6 +55,8 @@ python -m pytest tests/ -v
 - `GET /` - Serves the interactive dashboard HTML
 - `GET /api/data?horizon=24h` - Returns chart traces, table rows, and insights as JSON
 - `POST /api/probability` - Calculates target price probability (body: `{"asset": "SPY", "target_price": 600, "horizon": "24h"}`)
+- `GET /api/gtrade/config` - Returns gTrade contract addresses, pair indices, and trading constraints
+- `POST /api/gtrade/validate-trade` - Server-side trade validation (body: `{"asset": "SPY", "collateral": 100, "leverage": 15}`)
 
 ## Trading Integration
 

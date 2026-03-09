@@ -34,7 +34,10 @@ from chart import (
     get_assets_for_horizon,
     calculate_target_probability,
 )
-from main import generate_dashboard_html, create_app, build_insights, make_time_points
+from main import (
+    generate_dashboard_html, create_app, build_insights, make_time_points,
+    validate_trade_params, GTRADE_CONFIG, TRADEABLE_ASSETS,
+)
 
 
 def _make_client():
@@ -527,7 +530,7 @@ def test_dashboard_has_wallet_button():
 
 
 def test_dashboard_has_trade_panel():
-    """Verify trade panel HTML is present."""
+    """Verify trade panel element exists in dashboard HTML."""
     client = _make_client()
     html = generate_dashboard_html(client)
     assert 'id="trade-panel"' in html
@@ -536,43 +539,38 @@ def test_dashboard_has_trade_panel():
 
 
 def test_dashboard_has_ethers_cdn():
-    """Verify ethers.js CDN script is included."""
+    """Verify ethers.js CDN script tag is included."""
     client = _make_client()
     html = generate_dashboard_html(client)
-    assert "ethers" in html
     assert "cdn.jsdelivr.net" in html
+    assert "ethers" in html
 
 
 def test_dashboard_has_trade_buttons_for_equities():
-    """Verify trade buttons appear for tradeable equity assets."""
+    """Verify trade buttons appear for all equity assets."""
     client = _make_client()
     html = generate_dashboard_html(client)
-    assert 'data-asset="SPY"' in html
-    assert 'data-asset="NVDA"' in html
-    assert 'data-asset="TSLA"' in html
-    assert 'data-asset="AAPL"' in html
-    assert 'data-asset="GOOGL"' in html
+    for eq in ["SPY", "NVDA", "TSLA", "AAPL", "GOOGL"]:
+        assert f'data-asset="{eq}"' in html
 
 
 def test_dashboard_no_trade_buttons_for_crypto():
-    """Verify crypto assets do not have trade buttons."""
+    """Verify trade buttons do NOT appear for crypto/commodity assets."""
     client = _make_client()
     html = generate_dashboard_html(client)
-    assert 'data-asset="BTC"' not in html
-    assert 'data-asset="ETH"' not in html
-    assert 'data-asset="SOL"' not in html
-    assert 'data-asset="XAU"' not in html
+    for cr in ["BTC", "ETH", "SOL", "XAU"]:
+        assert f'data-asset="{cr}"' not in html
 
 
 def test_dashboard_has_toast_container():
-    """Verify toast notification container is present."""
+    """Verify toast notification container exists."""
     client = _make_client()
     html = generate_dashboard_html(client)
     assert 'id="toast-container"' in html
 
 
 def test_dashboard_has_gtrade_config():
-    """Verify gTrade configuration constants are in JS."""
+    """Verify gTrade configuration is embedded in dashboard JS."""
     client = _make_client()
     html = generate_dashboard_html(client)
     assert "GTRADE_CONFIG" in html
@@ -582,7 +580,7 @@ def test_dashboard_has_gtrade_config():
 
 
 def test_dashboard_has_wallet_manager():
-    """Verify WalletManager functions are present in JS."""
+    """Verify wallet management functions exist in dashboard JS."""
     client = _make_client()
     html = generate_dashboard_html(client)
     assert "handleWalletConnect" in html
@@ -594,7 +592,7 @@ def test_dashboard_has_wallet_manager():
 
 
 def test_dashboard_has_trade_execution():
-    """Verify trade execution functions are present in JS."""
+    """Verify trade execution functions and ABIs exist in dashboard JS."""
     client = _make_client()
     html = generate_dashboard_html(client)
     assert "submitTrade" in html
@@ -611,11 +609,118 @@ def test_table_rows_have_trade_column():
     with app.test_client() as tc:
         resp = tc.get("/api/data?horizon=24h")
         data = json.loads(resp.data)
-        # Equity rows should have trade buttons
         assert 'trade-cell-btn' in data["table_rows"]
         assert 'data-asset="SPY"' in data["table_rows"]
-        # Crypto rows should have '--'
         assert 'trade-cell-na' in data["table_rows"]
+
+
+# --- Tests for server-side trade validation and config ---
+
+
+def test_validate_trade_params_valid():
+    """Verify valid trade params produce no errors."""
+    errors = validate_trade_params({"asset": "SPY", "collateral": 100, "leverage": 15})
+    assert errors == []
+
+
+def test_validate_trade_params_invalid_asset():
+    """Verify unsupported asset is rejected."""
+    errors = validate_trade_params({"asset": "BTC", "collateral": 100, "leverage": 15})
+    assert any("not supported" in e for e in errors)
+
+
+def test_validate_trade_params_below_min_position():
+    """Verify position below minimum size is rejected."""
+    errors = validate_trade_params({"asset": "SPY", "collateral": 10, "leverage": 2})
+    assert any("below minimum" in e for e in errors)
+
+
+def test_validate_trade_params_leverage_out_of_range():
+    """Verify leverage outside allowed range is rejected."""
+    errors_high = validate_trade_params({"asset": "SPY", "collateral": 1000, "leverage": 200})
+    assert any("Leverage" in e for e in errors_high)
+
+    errors_low = validate_trade_params({"asset": "SPY", "collateral": 1000, "leverage": 1})
+    assert any("Leverage" in e for e in errors_low)
+
+
+def test_validate_trade_params_bad_collateral():
+    """Verify negative collateral is rejected."""
+    errors = validate_trade_params({"asset": "SPY", "collateral": -5, "leverage": 15})
+    assert any("positive" in e for e in errors)
+
+
+def test_validate_trade_params_bad_slippage():
+    """Verify slippage outside allowed range is rejected."""
+    errors = validate_trade_params({"asset": "SPY", "collateral": 100, "leverage": 15, "slippage": 10})
+    assert any("Slippage" in e for e in errors)
+
+
+def test_flask_api_gtrade_config():
+    """Verify /api/gtrade/config returns correct configuration."""
+    client = _make_client()
+    app = create_app(client)
+    with app.test_client() as tc:
+        resp = tc.get("/api/gtrade/config")
+        cfg = json.loads(resp.data)
+        assert cfg["chain_id"] == 42161
+        assert cfg["pair_indices"]["SPY"] == 86
+        assert "diamond_address" in cfg
+        assert "gtrade_app_url" in cfg
+
+
+def test_flask_api_gtrade_validate_valid():
+    """Verify /api/gtrade/validate-trade accepts valid trade."""
+    client = _make_client()
+    app = create_app(client)
+    with app.test_client() as tc:
+        resp = tc.post(
+            "/api/gtrade/validate-trade",
+            data=json.dumps({"asset": "SPY", "collateral": 100, "leverage": 15}),
+            content_type="application/json",
+        )
+        assert resp.status_code == 200
+        data = json.loads(resp.data)
+        assert data["valid"] is True
+        assert data["pair_index"] == 86
+
+
+def test_flask_api_gtrade_validate_invalid():
+    """Verify /api/gtrade/validate-trade rejects invalid trade."""
+    client = _make_client()
+    app = create_app(client)
+    with app.test_client() as tc:
+        resp = tc.post(
+            "/api/gtrade/validate-trade",
+            data=json.dumps({"asset": "BTC", "collateral": 5, "leverage": 200}),
+            content_type="application/json",
+        )
+        assert resp.status_code == 400
+        data = json.loads(resp.data)
+        assert data["valid"] is False
+        assert len(data["errors"]) >= 2
+
+
+def test_gtrade_config_matches_tradeable_assets():
+    """Verify GTRADE_CONFIG pair indices match TRADEABLE_ASSETS."""
+    assert set(GTRADE_CONFIG["pair_indices"].keys()) == TRADEABLE_ASSETS
+
+
+def test_dashboard_has_gtrade_fallback_link():
+    """Verify gTrade fallback link appears in error handler."""
+    client = _make_client()
+    html = generate_dashboard_html(client)
+    assert "gains.trade/trading" in html
+    assert "Try on gTrade" in html
+
+
+def test_dashboard_calls_server_validation():
+    """Verify submitTrade calls /api/gtrade/validate-trade before on-chain tx."""
+    client = _make_client()
+    html = generate_dashboard_html(client)
+    assert "/api/gtrade/validate-trade" in html
+    assert "valData.valid" in html
+    assert "valData.pair_index" in html
 
 
 if __name__ == "__main__":
@@ -663,4 +768,16 @@ if __name__ == "__main__":
     test_dashboard_has_wallet_manager()
     test_dashboard_has_trade_execution()
     test_table_rows_have_trade_column()
+    test_validate_trade_params_valid()
+    test_validate_trade_params_invalid_asset()
+    test_validate_trade_params_below_min_position()
+    test_validate_trade_params_leverage_out_of_range()
+    test_validate_trade_params_bad_collateral()
+    test_validate_trade_params_bad_slippage()
+    test_flask_api_gtrade_config()
+    test_flask_api_gtrade_validate_valid()
+    test_flask_api_gtrade_validate_invalid()
+    test_gtrade_config_matches_tradeable_assets()
+    test_dashboard_has_gtrade_fallback_link()
+    test_dashboard_calls_server_validation()
     print("All tests passed!")
