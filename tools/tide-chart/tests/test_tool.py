@@ -515,6 +515,109 @@ def test_flask_api_probability_missing_body():
         assert resp.status_code == 400
 
 
+# --- Tests for issue #14 wallet and trading integration ---
+
+
+def test_dashboard_has_wallet_button():
+    """Verify wallet connect button is present in dashboard HTML."""
+    client = _make_client()
+    html = generate_dashboard_html(client)
+    assert 'id="wallet-btn"' in html
+    assert "Connect Wallet" in html
+
+
+def test_dashboard_has_trade_panel():
+    """Verify trade panel HTML is present."""
+    client = _make_client()
+    html = generate_dashboard_html(client)
+    assert 'id="trade-panel"' in html
+    assert "trade-form-grid" in html
+    assert "trade-connect-overlay" in html
+
+
+def test_dashboard_has_ethers_cdn():
+    """Verify ethers.js CDN script is included."""
+    client = _make_client()
+    html = generate_dashboard_html(client)
+    assert "ethers" in html
+    assert "cdn.jsdelivr.net" in html
+
+
+def test_dashboard_has_trade_buttons_for_equities():
+    """Verify trade buttons appear for tradeable equity assets."""
+    client = _make_client()
+    html = generate_dashboard_html(client)
+    assert 'data-asset="SPY"' in html
+    assert 'data-asset="NVDA"' in html
+    assert 'data-asset="TSLA"' in html
+    assert 'data-asset="AAPL"' in html
+    assert 'data-asset="GOOGL"' in html
+
+
+def test_dashboard_no_trade_buttons_for_crypto():
+    """Verify crypto assets do not have trade buttons."""
+    client = _make_client()
+    html = generate_dashboard_html(client)
+    assert 'data-asset="BTC"' not in html
+    assert 'data-asset="ETH"' not in html
+    assert 'data-asset="SOL"' not in html
+    assert 'data-asset="XAU"' not in html
+
+
+def test_dashboard_has_toast_container():
+    """Verify toast notification container is present."""
+    client = _make_client()
+    html = generate_dashboard_html(client)
+    assert 'id="toast-container"' in html
+
+
+def test_dashboard_has_gtrade_config():
+    """Verify gTrade configuration constants are in JS."""
+    client = _make_client()
+    html = generate_dashboard_html(client)
+    assert "GTRADE_CONFIG" in html
+    assert "0xFF162c694eAA571f685030649814282eA457f169" in html
+    assert "0xaf88d065e77c8cC2239327C5EDb3A432268e5831" in html
+    assert "42161" in html
+
+
+def test_dashboard_has_wallet_manager():
+    """Verify WalletManager functions are present in JS."""
+    client = _make_client()
+    html = generate_dashboard_html(client)
+    assert "handleWalletConnect" in html
+    assert "switchToArbitrum" in html
+    assert "walletState" in html
+    assert "eth_requestAccounts" in html
+    assert "wallet_switchEthereumChain" in html
+    assert "wallet_addEthereumChain" in html
+
+
+def test_dashboard_has_trade_execution():
+    """Verify trade execution functions are present in JS."""
+    client = _make_client()
+    html = generate_dashboard_html(client)
+    assert "submitTrade" in html
+    assert "openTradePanel" in html
+    assert "closeTradePanel" in html
+    assert "DIAMOND_ABI" in html
+    assert "ERC20_ABI" in html
+
+
+def test_table_rows_have_trade_column():
+    """Verify table rows include trade button cells."""
+    client = _make_client()
+    app = create_app(client)
+    with app.test_client() as tc:
+        resp = tc.get("/api/data?horizon=24h")
+        data = json.loads(resp.data)
+        # Equity rows should have trade buttons
+        assert 'trade-cell-btn' in data["table_rows"]
+        assert 'data-asset="SPY"' in data["table_rows"]
+        # Crypto rows should have '--'
+        assert 'trade-cell-na' in data["table_rows"]
+
+
 if __name__ == "__main__":
     test_client_loads_in_mock_mode()
     test_fetch_all_equities_data()
@@ -550,4 +653,14 @@ if __name__ == "__main__":
     test_flask_api_probability_invalid_asset()
     test_flask_api_probability_invalid_price()
     test_flask_api_probability_missing_body()
+    test_dashboard_has_wallet_button()
+    test_dashboard_has_trade_panel()
+    test_dashboard_has_ethers_cdn()
+    test_dashboard_has_trade_buttons_for_equities()
+    test_dashboard_no_trade_buttons_for_crypto()
+    test_dashboard_has_toast_container()
+    test_dashboard_has_gtrade_config()
+    test_dashboard_has_wallet_manager()
+    test_dashboard_has_trade_execution()
+    test_table_rows_have_trade_column()
     print("All tests passed!")
