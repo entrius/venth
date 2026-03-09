@@ -16,7 +16,8 @@ Chrome extension that uses Chrome's **native Side Panel** to show Synth market c
 1. **Content script** (on `polymarket.com`) reads the market slug from the page URL.
 2. **Side panel page** requests context from the content script and fetches Synth edge data from local API (`GET /api/edge?slug=...`).
 3. **Panel rendering** displays Synth forecast data (prices, edge, signal, confidence, analysis, invalidation) and updates every 15s or on manual refresh.
-4. **Background service worker** enables/disables side panel per-tab based on URL.
+4. **Background service worker** enables/disables side panel per-tab based on URL and runs the alert polling engine.
+5. **Edge alerts** poll watched markets every 60s via `chrome.alarms`. When edge exceeds the user's threshold, a browser notification fires with asset, edge size, signal direction, and confidence. Clicking the notification focuses or opens the relevant Polymarket page. Notifications are suppressed when the user is already viewing the market and have a 5-minute cooldown per market to avoid spam.
 
 ## Synth API usage
 

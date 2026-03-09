@@ -3,7 +3,7 @@
   "name": "Synth Panel",
   "version": "1.2.0",
   "description": "Chrome Side Panel for Synth forecast data on market sites",
-  "permissions": ["activeTab", "tabs", "sidePanel"],
+  "permissions": ["activeTab", "tabs", "sidePanel", "notifications", "storage", "alarms"],
   "host_permissions": [
     "https://polymarket.com/*",
     "http://127.0.0.1:8765/*"

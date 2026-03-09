@@ -363,6 +363,96 @@ setInterval(async function() {
   } catch (_e) {}
 }, 1000);
 
+// ---- Alerts UI ----
+
+var alertEls = {
+  enabled: document.getElementById("alertsEnabled"),
+  body: document.getElementById("alertsBody"),
+  threshold: document.getElementById("alertThreshold"),
+  watchlist: document.getElementById("watchlist"),
+  watchBtn: document.getElementById("watchBtn"),
+};
+
+function renderWatchlist(list) {
+  alertEls.watchlist.innerHTML = "";
+  if (!list || list.length === 0) {
+    var hint = document.createElement("div");
+    hint.className = "watch-empty";
+    hint.textContent = "No markets watched yet";
+    alertEls.watchlist.appendChild(hint);
+    updateWatchBtnState();
+    return;
+  }
+  list.forEach(function (item) {
+    var row = document.createElement("div");
+    row.className = "watch-item";
+    var label = document.createElement("span");
+    label.textContent = item.label || item.slug;
+    var btn = document.createElement("button");
+    btn.className = "watch-remove";
+    btn.textContent = "\u00d7";
+    btn.title = "Remove from watchlist";
+    btn.addEventListener("click", function () {
+      SynthAlerts.removeFromWatchlist(item.slug, renderWatchlist);
+    });
+    row.appendChild(label);
+    row.appendChild(btn);
+    alertEls.watchlist.appendChild(row);
+  });
+  updateWatchBtnState();
+}
+
+function updateWatchBtnState() {
+  if (!currentSlug) {
+    alertEls.watchBtn.disabled = true;
+    alertEls.watchBtn.textContent = "No market loaded";
+    return;
+  }
+  SynthAlerts.load(function (settings) {
+    var watching = settings.watchlist.some(function (w) { return w.slug === currentSlug; });
+    if (watching) {
+      alertEls.watchBtn.disabled = true;
+      alertEls.watchBtn.textContent = "Already watching";
+    } else if (settings.watchlist.length >= SynthAlerts.MAX_WATCHLIST) {
+      alertEls.watchBtn.disabled = true;
+      alertEls.watchBtn.textContent = "Watchlist full (" + SynthAlerts.MAX_WATCHLIST + " max)";
+    } else {
+      alertEls.watchBtn.disabled = false;
+      alertEls.watchBtn.textContent = "+ Watch this market";
+    }
+  });
+}
+
+function initAlertsUI() {
+  SynthAlerts.load(function (settings) {
+    alertEls.enabled.checked = settings.enabled;
+    alertEls.body.classList.toggle("hidden", !settings.enabled);
+    alertEls.threshold.value = settings.threshold;
+    renderWatchlist(settings.watchlist);
+  });
+}
+
+alertEls.enabled.addEventListener("change", function () {
+  var on = alertEls.enabled.checked;
+  SynthAlerts.saveEnabled(on);
+  alertEls.body.classList.toggle("hidden", !on);
+});
+
+alertEls.threshold.addEventListener("change", function () {
+  var clamped = SynthAlerts.saveThreshold(alertEls.threshold.value);
+  alertEls.threshold.value = clamped;
+});
+
+alertEls.watchBtn.addEventListener("click", function () {
+  if (!currentSlug) return;
+  var asset = cachedSynthData ? (cachedSynthData.asset || "BTC") : "BTC";
+  var mtype = cachedMarketType || "daily";
+  var label = SynthAlerts.formatMarketLabel(asset, mtype);
+  SynthAlerts.addToWatchlist(currentSlug, asset, label, renderWatchlist);
+});
+
+initAlertsUI();
+
 // Start polling
 refresh();
 setInterval(refresh, SYNTH_POLL_INTERVAL_MS);

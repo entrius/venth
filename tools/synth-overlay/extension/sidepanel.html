@@ -67,12 +67,34 @@
       <p id="invalidationText" class="text muted">—</p>
     </section>
 
+    <section class="card" id="alertsCard">
+      <div class="alert-header">
+        <div class="label" style="margin-bottom:0">Alerts</div>
+        <label class="toggle">
+          <input type="checkbox" id="alertsEnabled" />
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+      <div id="alertsBody" class="hidden">
+        <div class="alert-row">
+          <span>Edge threshold</span>
+          <div class="threshold-input">
+            <input type="number" id="alertThreshold" min="0.5" max="50" step="0.5" value="3.0" />
+            <span class="unit">pp</span>
+          </div>
+        </div>
+        <button id="watchBtn" class="watch-btn" disabled>No market loaded</button>
+        <div id="watchlist" class="watchlist"></div>
+      </div>
+    </section>
+
     <footer class="footer">
       <span>Data as of:</span>
       <strong id="lastUpdate">—</strong>
       <div class="poll-bar"><div id="pollProgress" class="poll-fill"></div></div>
     </footer>
 
+    <script src="alerts.js"></script>
     <script src="sidepanel.js"></script>
   </body>
 </html>
