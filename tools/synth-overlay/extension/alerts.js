@@ -5,10 +5,12 @@
  * sidepanel.js (UI) and background.js (polling engine).
  *
  * Storage keys (chrome.storage.local):
- *   synth_alerts_enabled    : boolean
- *   synth_alerts_threshold  : number  (edge pp, default 3.0)
- *   synth_alerts_watchlist  : Array<{ slug, asset, label, addedAt }>
- *   synth_alerts_cooldowns  : Object  { slug: timestamp }
+ *   synth_alerts_enabled      : boolean
+ *   synth_alerts_threshold    : number  (edge pp, default 3.0)
+ *   synth_alerts_watchlist    : Array<{ slug, asset, label, addedAt }>
+ *   synth_alerts_cooldowns    : Object  { slug: timestamp }
+ *   synth_alerts_history      : Array<{ slug, label, title, message, edgePct, signal, timestamp }>
+ *   synth_alerts_auto_dismiss : boolean  (default false)
  */
 
 var SynthAlerts = (function () {
