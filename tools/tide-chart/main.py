@@ -11,10 +11,14 @@ variable time horizons (1h/24h), and live auto-refresh.
 """
 
 import json
+import time
 import webbrowser
 import threading
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+from typing import Optional
+
+import requests as http_requests
 
 from flask import Flask, jsonify, request, Response
 from synth_client import SynthClient
@@ -31,13 +35,37 @@ from chart import (
     get_assets_for_horizon,
 )
 
-# Per-asset-group gTrade leverage constraints (from gTrade docs)
+# Per-asset-group gTrade leverage constraints (from gTrade backend /trading-variables API)
+# API returns values in 1e3 precision: e.g. 200000 = 200x, 1100 = 1.1x
 ASSET_GROUPS = {
-    "crypto":      {"min_leverage": 1.1, "max_leverage": 500, "assets": ["BTC", "ETH", "SOL"]},
+    "crypto":      {"min_leverage": 1.1, "max_leverage": 200, "assets": ["BTC", "ETH"]},
+    "altcoins":    {"min_leverage": 1.1, "max_leverage": 150, "assets": ["SOL"]},
     "stocks":      {"min_leverage": 1.1, "max_leverage": 50,  "assets": ["NVDA", "TSLA", "AAPL", "GOOGL"]},
-    "indices":     {"min_leverage": 1.1, "max_leverage": 50,  "assets": ["SPY"]},
+    "indices":     {"min_leverage": 1.1, "max_leverage": 100, "assets": ["SPY"]},
     "commodities": {"min_leverage": 2,   "max_leverage": 250, "assets": ["XAU"]},
 }
+
+GTRADE_NETWORKS = {
+    "mainnet": {
+        "backend_url": "https://backend-arbitrum.gains.trade",
+        "chain_id": 42161,
+        "diamond_address": "0xFF162c694eAA571f685030649814282eA457f169",
+        "collateral_address": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+        "collateral_symbol": "USDC",
+        "collateral_decimals": 6,
+        "collateral_index": 3,
+    },
+    "testnet": {
+        "backend_url": "https://backend-sepolia.gains.trade",
+        "chain_id": 421614,
+        "diamond_address": "0xd659a15812064C79E189fd950A189b15c75d3186",
+        "collateral_address": "0x4cC7EbEeD5EA3adf3978F19833d2E1f3e8980cD6",
+        "collateral_symbol": "USDC",
+        "collateral_decimals": 6,
+        "collateral_index": 3,
+    },
+}
+GTRADE_BACKEND_URL = GTRADE_NETWORKS["mainnet"]["backend_url"]
 
 # Build asset -> group lookup
 ASSET_TO_GROUP = {}
@@ -47,6 +75,19 @@ for _group_name, _group_info in ASSET_GROUPS.items():
 
 TRADEABLE_ASSETS = set(ALL_ASSETS)
 
+# gTrade pair name mapping (ticker -> gTrade pair name for dynamic resolution)
+GTRADE_PAIRS = {
+    "BTC": {"name": "BTC/USD", "group_index": 0, "group": "crypto"},
+    "ETH": {"name": "ETH/USD", "group_index": 0, "group": "crypto"},
+    "SOL": {"name": "SOL/USD", "group_index": 0, "group": "crypto"},
+    "XAU": {"name": "XAU/USD", "group_index": 4, "group": "commodities"},
+    "SPY": {"name": "SPY/USD", "group_index": 3, "group": "stocks"},
+    "NVDA": {"name": "NVDA/USD", "group_index": 3, "group": "stocks"},
+    "TSLA": {"name": "TSLA/USD", "group_index": 3, "group": "stocks"},
+    "AAPL": {"name": "AAPL/USD", "group_index": 3, "group": "stocks"},
+    "GOOGL": {"name": "GOOGL/USD", "group_index": 3, "group": "stocks"},
+}
+
 # gTrade (Gains Network) configuration — server-side source of truth
 GTRADE_CONFIG = {
     "chain_id": 42161,
@@ -54,18 +95,96 @@ GTRADE_CONFIG = {
     "usdc_address": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
     "usdc_decimals": 6,
     "collateral_index": 3,
-    "pair_indices": {
-        "BTC": 0, "ETH": 1, "SOL": 33,
-        "SPY": 86, "NVDA": 65, "TSLA": 85, "AAPL": 58, "GOOGL": 82,
-        "XAU": 90,
+    "pairs": {
+        asset: {**info, "asset": asset}
+        for asset, info in GTRADE_PAIRS.items()
     },
-    "asset_groups": {
-        group_name: {"min_leverage": info["min_leverage"], "max_leverage": info["max_leverage"], "assets": info["assets"]}
+    "group_limits": {
+        group_name: {"min_leverage": info["min_leverage"], "max_leverage": info["max_leverage"],
+                     "min_position_usd": 1500, "max_collateral_usd": 100_000, "assets": info["assets"]}
         for group_name, info in ASSET_GROUPS.items()
     },
     "min_position_size_usd": 1500,
+    "collateral_limits": {"min_usd": 5},
     "gtrade_app_url": "https://gains.trade/trading",
 }
+
+# --- Dynamic pair index resolution via gTrade backend API ---
+_trading_vars_cache: dict[str, Optional[dict]] = {}
+_trading_vars_ts: dict[str, float] = {}
+
+
+def _get_backend_url(network: str = "mainnet") -> str:
+    return GTRADE_NETWORKS.get(network, GTRADE_NETWORKS["mainnet"])["backend_url"]
+
+
+def fetch_trading_variables(backend_url: str = "") -> Optional[dict]:
+    """Fetch live trading variables from gTrade backend."""
+    if not backend_url:
+        backend_url = GTRADE_BACKEND_URL
+    try:
+        resp = http_requests.get(f"{backend_url}/trading-variables", timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+    except (http_requests.RequestException, ValueError):
+        return None
+
+
+def get_cached_trading_variables(max_age_seconds: int = 300, network: str = "mainnet") -> Optional[dict]:
+    """Fetch trading variables with simple time-based caching."""
+    now = time.time()
+    if network in _trading_vars_cache and (now - _trading_vars_ts.get(network, 0)) < max_age_seconds:
+        return _trading_vars_cache[network]
+    result = fetch_trading_variables(_get_backend_url(network))
+    if result:
+        _trading_vars_cache[network] = result
+        _trading_vars_ts[network] = now
+    return _trading_vars_cache.get(network)
+
+
+def resolve_pair_index(asset: str, trading_vars: Optional[dict] = None, network: str = "mainnet") -> Optional[int]:
+    """Resolve a ticker to its gTrade pair index dynamically."""
+    if asset not in GTRADE_PAIRS:
+        return None
+    if trading_vars is None:
+        trading_vars = get_cached_trading_variables(network=network)
+    target_name = GTRADE_PAIRS[asset]["name"]
+    if trading_vars and "pairs" in trading_vars:
+        for i, pair in enumerate(trading_vars["pairs"]):
+            pair_from = pair.get("from", "")
+            pair_to = pair.get("to", "")
+            if f"{pair_from}/{pair_to}" == target_name:
+                return i
+    return None
+
+
+def get_pair_name_map(network: str = "mainnet") -> dict:
+    """Build a pairIndex -> name mapping from cached trading variables."""
+    tv = get_cached_trading_variables(network=network)
+    if not tv or "pairs" not in tv:
+        return {}
+    result = {}
+    for i, pair in enumerate(tv["pairs"]):
+        pair_from = pair.get("from", "")
+        pair_to = pair.get("to", "")
+        if pair_from:
+            result[i] = f"{pair_from}/{pair_to}"
+    return result
+
+
+def fetch_open_trades(address: str, network: str = "mainnet") -> list[dict]:
+    """Fetch open trades for a wallet address from the gTrade backend."""
+    if not address:
+        return []
+    backend_url = _get_backend_url(network)
+    try:
+        resp = http_requests.get(
+            f"{backend_url}/open-trades/{address.lower()}", timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, list) else []
+    except (http_requests.RequestException, ValueError):
+        return []
 
 
 def get_asset_leverage_limits(asset: str) -> tuple[float, float]:
@@ -77,32 +196,36 @@ def get_asset_leverage_limits(asset: str) -> tuple[float, float]:
     return 1.1, 50  # safe default
 
 
-def validate_trade_params(params: dict) -> list[str]:
-    """Validate trade parameters server-side with per-group leverage limits."""
-    errors = []
-    asset = params.get("asset", "")
-    collateral = params.get("collateral", 0)
-    leverage = params.get("leverage", 0)
+def validate_trade_params(asset: str, direction: str, leverage: float, collateral_usd: float) -> tuple[bool, str]:
+    """Validate trade parameters against gTrade protocol limits.
 
-    if asset not in GTRADE_CONFIG["pair_indices"]:
-        errors.append(f"Asset '{asset}' is not supported for trading.")
-    if not isinstance(collateral, (int, float)) or collateral <= 0:
-        errors.append("Collateral must be a positive number.")
-    if not isinstance(leverage, (int, float)):
-        errors.append("Leverage must be a number.")
-    elif asset in ASSET_TO_GROUP:
-        min_lev, max_lev = get_asset_leverage_limits(asset)
-        if leverage < min_lev or leverage > max_lev:
-            group = ASSET_TO_GROUP[asset]
-            errors.append(f"Leverage must be between {min_lev}x and {max_lev}x for {group} assets.")
-    if isinstance(collateral, (int, float)) and isinstance(leverage, (int, float)) and collateral > 0 and leverage > 0:
-        position_size = collateral * leverage
-        if position_size < GTRADE_CONFIG["min_position_size_usd"]:
-            errors.append(f"Position size ${position_size:,.2f} is below minimum ${GTRADE_CONFIG['min_position_size_usd']:,}.")
-    slippage = params.get("slippage", 1.0)
-    if isinstance(slippage, (int, float)) and (slippage < 0.1 or slippage > 5.0):
-        errors.append("Slippage must be between 0.1% and 5.0%.")
-    return errors
+    Returns (is_valid, error_message).
+    """
+    if asset not in GTRADE_PAIRS:
+        return False, f"{asset} is not available for trading on gTrade"
+
+    if direction not in ("long", "short"):
+        return False, "Direction must be 'long' or 'short'"
+
+    min_lev, max_lev = get_asset_leverage_limits(asset)
+
+    if not isinstance(leverage, (int, float)) or leverage < min_lev:
+        return False, f"Leverage must be at least {min_lev}x"
+
+    if leverage > max_lev:
+        return False, f"Leverage cannot exceed {max_lev}x"
+
+    if not isinstance(collateral_usd, (int, float)) or collateral_usd < 5:
+        return False, "Minimum collateral is $5"
+
+    if collateral_usd > 100_000:
+        return False, "Maximum collateral is $100,000"
+
+    position_usd = collateral_usd * leverage
+    if position_usd < GTRADE_CONFIG["min_position_size_usd"]:
+        return False, f"Position size (${position_usd:,.0f}) below minimum $1,500"
+
+    return True, ""
 
 
 ASSET_COLORS = {
@@ -505,6 +628,44 @@ def generate_dashboard_html(client) -> str:
         "  .wallet-dot { width: 6px; height: 6px; border-radius: 50%;\n"
         "    background: var(--positive); box-shadow: 0 0 6px var(--positive); flex-shrink: 0; }\n"
         "\n"
+        "  /* Network toggle */\n"
+        "  .network-toggle-wrapper {\n"
+        "    display: flex; align-items: center; gap: 6px; margin-left: auto;\n"
+        "  }\n"
+        "  .network-label {\n"
+        "    font-family: 'IBM Plex Mono', monospace; font-size: 10px;\n"
+        "    color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.5px;\n"
+        "  }\n"
+        "  .network-switch {\n"
+        "    position: relative; display: inline-block; width: 36px; height: 20px;\n"
+        "  }\n"
+        "  .network-switch input { opacity: 0; width: 0; height: 0; }\n"
+        "  .network-slider {\n"
+        "    position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0;\n"
+        "    background: var(--bg-deep); border: 1px solid var(--border); border-radius: 20px;\n"
+        "    transition: all 0.3s;\n"
+        "  }\n"
+        "  .network-slider:before {\n"
+        "    position: absolute; content: ''; height: 14px; width: 14px;\n"
+        "    left: 2px; bottom: 2px; background: var(--text-secondary);\n"
+        "    border-radius: 50%; transition: all 0.3s;\n"
+        "  }\n"
+        "  .network-switch input:checked + .network-slider {\n"
+        "    background: rgba(251,191,36,0.15); border-color: rgba(251,191,36,0.4);\n"
+        "  }\n"
+        "  .network-switch input:checked + .network-slider:before {\n"
+        "    transform: translateX(16px); background: #fbbf24;\n"
+        "  }\n"
+        "  .testnet-banner {\n"
+        "    background: rgba(251,191,36,0.12); border: 1px solid rgba(251,191,36,0.3);\n"
+        "    color: #fbbf24; text-align: center; padding: 6px 12px; border-radius: 6px;\n"
+        "    font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 600;\n"
+        "    letter-spacing: 1px; margin-bottom: 12px;\n"
+        "  }\n"
+        "  .wallet-network-badge.testnet {\n"
+        "    background: rgba(251,191,36,0.15); color: #fbbf24;\n"
+        "  }\n"
+        "\n"
         "  /* Toast notifications */\n"
         "  .toast-container {\n"
         "    position: fixed; bottom: 20px; right: 20px; z-index: 1000;\n"
@@ -631,6 +792,15 @@ def generate_dashboard_html(client) -> str:
         "  }\n"
         "  .trade-submit-btn.short:hover:not(:disabled) { background: rgba(240,96,112,0.3); }\n"
         "  .trade-submit-btn:disabled { opacity: 0.4; cursor: not-allowed; }\n"
+        "  .trade-preview {\n"
+        "    margin-top: 14px; padding: 12px 16px; background: var(--bg-deep);\n"
+        "    border: 1px solid var(--border); border-radius: 6px; display: none;\n"
+        "  }\n"
+        "  .preview-row {\n"
+        "    display: flex; justify-content: space-between; padding: 4px 0;\n"
+        "    font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--text-secondary);\n"
+        "  }\n"
+        "  .preview-row span:last-child { color: var(--text-primary); }\n"
         "  .trade-info-row {\n"
         "    display: flex; justify-content: center; gap: 24px; margin-top: 12px;\n"
         "    font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: var(--text-muted);\n"
@@ -647,6 +817,44 @@ def generate_dashboard_html(client) -> str:
         "  .trade-cell-na { font-family: 'IBM Plex Mono', monospace; font-size: 10px;\n"
         "    color: var(--text-muted); }\n"
         "\n"
+        "  /* Open positions & trade history */\n"
+        "  .positions-container {\n"
+        "    background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px;\n"
+        "    padding: 16px 20px; margin-bottom: 20px;\n"
+        "  }\n"
+        "  .open-trades-section { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border); }\n"
+        "  .open-trades-section:first-child { margin-top: 0; padding-top: 0; border-top: none; }\n"
+        "  .open-trades-header { font-family: 'IBM Plex Mono', monospace; font-size: 10px;\n"
+        "    text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); margin-bottom: 8px; }\n"
+        "  .open-trade-row {\n"
+        "    display: flex; justify-content: space-between; align-items: center;\n"
+        "    padding: 8px 12px; background: var(--bg-deep); border: 1px solid var(--border);\n"
+        "    border-radius: 6px; margin-bottom: 6px; font-family: 'IBM Plex Mono', monospace; font-size: 11px;\n"
+        "  }\n"
+        "  .trade-row-info { flex: 1; }\n"
+        "  .trade-row-main { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }\n"
+        "  .trade-row-pnl { margin-top: 4px; font-size: 10px; }\n"
+        "  .trade-pnl { font-weight: 600; }\n"
+        "  .close-trade-btn {\n"
+        "    background: rgba(240,96,112,0.1); border: 1px solid rgba(240,96,112,0.3);\n"
+        "    color: var(--negative); font-size: 12px; cursor: pointer; padding: 4px 8px;\n"
+        "    border-radius: 4px; transition: all 0.2s; flex-shrink: 0;\n"
+        "  }\n"
+        "  .close-trade-btn:hover { background: rgba(240,96,112,0.25); }\n"
+        "  .no-trades { font-size: 11px; color: var(--text-muted); text-align: center; padding: 12px; }\n"
+        "  .history-row { opacity: 0.7; }\n"
+        "  .history-badge {\n"
+        "    font-size: 9px; padding: 2px 6px; border-radius: 3px;\n"
+        "    background: rgba(94,163,188,0.15); color: #5ea3bc; flex-shrink: 0;\n"
+        "  }\n"
+        "  .trade-status { padding: 8px 12px; border-radius: 6px; font-size: 11px;\n"
+        "    font-family: 'IBM Plex Mono', monospace; margin-top: 8px; display: none; }\n"
+        "  .trade-status.error { background: rgba(240,96,112,0.1); color: var(--negative); }\n"
+        "  .trade-status.success { background: rgba(52,211,153,0.1); color: var(--positive); }\n"
+        "  .trade-fallback { display: none; margin-top: 8px; font-size: 11px;\n"
+        "    font-family: 'IBM Plex Mono', monospace; text-align: center; }\n"
+        "  .trade-fallback a { color: var(--accent); }\n"
+        "\n"
         "  @media (max-width: 768px) {\n"
         "    .insights { grid-template-columns: 1fr; }\n"
         "    .title { font-size: 22px; }\n"
@@ -660,11 +868,19 @@ def generate_dashboard_html(client) -> str:
         "  }\n"
         "</style>\n</head>\n<body>\n"
         '<div class="dashboard">\n'
+        '  <div class="testnet-banner" id="testnet-banner" style="display:none">TESTNET MODE &mdash; Arbitrum Sepolia</div>\n'
         "\n"
         '  <div class="header">\n'
         '    <div class="header-top">\n'
         '      <h1 class="title">Tide Chart</h1>\n'
         f'      <span class="badge" id="horizon-badge">{horizon_label}</span>\n'
+        '      <div class="network-toggle-wrapper">\n'
+        '        <span class="network-label" id="network-label">Mainnet</span>\n'
+        '        <label class="network-switch">\n'
+        '          <input type="checkbox" id="network-toggle">\n'
+        '          <span class="network-slider"></span>\n'
+        '        </label>\n'
+        '      </div>\n'
         '      <button class="wallet-btn" id="wallet-btn">\n'
         '        <span id="wallet-btn-text">Connect Wallet</span>\n'
         '      </button>\n'
@@ -753,7 +969,7 @@ def generate_dashboard_html(client) -> str:
         '            </div>\n'
         '          </div>\n'
         '          <div class="trade-field">\n'
-        '            <label>Collateral (USDC) <span class="hint" id="trade-balance"></span></label>\n'
+        '            <label id="trade-collateral-label">Collateral (USDC) <span class="hint" id="trade-balance"></span></label>\n'
         '            <input type="number" id="trade-collateral" step="0.01" min="0" placeholder="100.00">\n'
         '            <div class="field-error" id="trade-collateral-error"></div>\n'
         '          </div>\n'
@@ -770,27 +986,44 @@ def generate_dashboard_html(client) -> str:
         '            </div>\n'
         '          </div>\n'
         '          <div class="trade-field">\n'
-        '            <label>Take Profit (%)</label>\n'
-        '            <input type="number" id="trade-tp" step="0.1" min="0" placeholder="Optional">\n'
+        '            <label>Take Profit (%) <span class="hint" id="tp-hint">max 900/lev</span></label>\n'
+        '            <input type="number" id="trade-tp" step="0.01" min="0" placeholder="Optional">\n'
         '          </div>\n'
         '          <div class="trade-field">\n'
-        '            <label>Stop Loss (%)</label>\n'
-        '            <input type="number" id="trade-sl" step="0.1" min="0" placeholder="Optional">\n'
+        '            <label>Stop Loss (%) <span class="hint" id="sl-hint">max 75/lev</span></label>\n'
+        '            <input type="number" id="trade-sl" step="0.01" min="0" placeholder="Optional">\n'
         '          </div>\n'
         '          <div class="trade-field full-width">\n'
         '            <label>Position Size</label>\n'
         '            <div class="trade-position-size" id="trade-position-size">$0.00</div>\n'
         '          </div>\n'
+        '          <div class="trade-preview" id="trade-preview"></div>\n'
         '          <div class="trade-field full-width">\n'
         '            <button class="trade-submit-btn long" id="trade-submit-btn" disabled>Connect Wallet</button>\n'
         '          </div>\n'
         '        </div>\n'
         '        <div class="trade-info-row">\n'
         '          <span>Min position: $1,500</span>\n'
-        '          <span>Network: Arbitrum</span>\n'
-        '          <span>Collateral: USDC</span>\n'
+        '          <span id="trade-network-info">Network: Arbitrum</span>\n'
+        '          <span id="trade-collateral-info">Collateral: USDC</span>\n'
+        '        </div>\n'
+        '        <div id="trade-status" class="trade-status"></div>\n'
+        '        <div id="trade-fallback" class="trade-fallback">\n'
+        '          Open on <a href="https://gains.trade/trading" target="_blank" rel="noopener">gTrade</a> directly\n'
         '        </div>\n'
         '      </div>\n'
+        '    </div>\n'
+        '  </div>\n'
+        "\n"
+        '  <!-- Open Positions & History — always visible when wallet connected -->\n'
+        '  <div class="positions-container" id="positions-container" style="display:none">\n'
+        '    <div class="open-trades-section">\n'
+        '      <div class="open-trades-header">Open Positions</div>\n'
+        '      <div id="open-trades-list"><div class="no-trades">No open positions</div></div>\n'
+        '    </div>\n'
+        '    <div class="open-trades-section">\n'
+        '      <div class="open-trades-header">Trade History</div>\n'
+        '      <div id="trade-history-list"><div class="no-trades">No trade history</div></div>\n'
         '    </div>\n'
         '  </div>\n'
         "\n"
@@ -995,36 +1228,79 @@ def generate_dashboard_html(client) -> str:
         "initSortableTable();\n"
         "\n"
         "/* ========== gTrade Configuration ========== */\n"
-        "var GTRADE_CONFIG = {\n"
-        "  chainId: 42161,\n"
-        "  chainIdHex: '0xa4b1',\n"
-        "  rpcUrl: 'https://arb1.arbitrum.io/rpc',\n"
-        "  chainName: 'Arbitrum One',\n"
-        "  explorerUrl: 'https://arbiscan.io',\n"
-        "  diamondAddress: '0xFF162c694eAA571f685030649814282eA457f169',\n"
-        "  usdcAddress: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831',\n"
-        "  usdcDecimals: 6,\n"
-        "  collateralIndex: 3,\n"
-        "  pairIndices: { BTC: 0, ETH: 1, SOL: 33, SPY: 86, NVDA: 65, TSLA: 85, AAPL: 58, GOOGL: 82, XAU: 90 },\n"
-        "  minPositionSizeUsd: 1500,\n"
-        "  assetGroups: {\n"
-        "    crypto:      { minLeverage: 1.1, maxLeverage: 500, assets: ['BTC', 'ETH', 'SOL'] },\n"
-        "    stocks:      { minLeverage: 1.1, maxLeverage: 50,  assets: ['NVDA', 'TSLA', 'AAPL', 'GOOGL'] },\n"
-        "    indices:     { minLeverage: 1.1, maxLeverage: 50,  assets: ['SPY'] },\n"
-        "    commodities: { minLeverage: 2,   maxLeverage: 250, assets: ['XAU'] }\n"
+        "var ASSET_GROUPS_CONFIG = {\n"
+        "  crypto:      { minLeverage: 1.1, maxLeverage: 200, assets: ['BTC', 'ETH'] },\n"
+        "  altcoins:    { minLeverage: 1.1, maxLeverage: 150, assets: ['SOL'] },\n"
+        "  stocks:      { minLeverage: 1.1, maxLeverage: 50,  assets: ['NVDA', 'TSLA', 'AAPL', 'GOOGL'] },\n"
+        "  indices:     { minLeverage: 1.1, maxLeverage: 100, assets: ['SPY'] },\n"
+        "  commodities: { minLeverage: 2,   maxLeverage: 250, assets: ['XAU'] }\n"
+        "};\n"
+        "var GTRADE_NETWORKS = {\n"
+        "  mainnet: {\n"
+        "    chainId: 42161, chainIdHex: '0xa4b1',\n"
+        "    rpcUrl: 'https://arb1.arbitrum.io/rpc',\n"
+        "    chainName: 'Arbitrum One', networkLabel: 'Arbitrum',\n"
+        "    explorerUrl: 'https://arbiscan.io',\n"
+        "    diamondAddress: '0xFF162c694eAA571f685030649814282eA457f169',\n"
+        "    collateralAddress: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831',\n"
+        "    collateralSymbol: 'USDC', collateralDecimals: 6, collateralIndex: 3,\n"
+        "    isTestnet: false, minPositionSizeUsd: 1500,\n"
+        "    assetGroups: ASSET_GROUPS_CONFIG\n"
+        "  },\n"
+        "  testnet: {\n"
+        "    chainId: 421614, chainIdHex: '0x66eee',\n"
+        "    rpcUrl: 'https://sepolia-rollup.arbitrum.io/rpc',\n"
+        "    chainName: 'Arbitrum Sepolia', networkLabel: 'Sepolia',\n"
+        "    explorerUrl: 'https://sepolia.arbiscan.io',\n"
+        "    diamondAddress: '0xd659a15812064C79E189fd950A189b15c75d3186',\n"
+        "    collateralAddress: '0x4cC7EbEeD5EA3adf3978F19833d2E1f3e8980cD6',\n"
+        "    collateralSymbol: 'USDC', collateralDecimals: 6, collateralIndex: 3,\n"
+        "    isTestnet: true, minPositionSizeUsd: 1500,\n"
+        "    assetGroups: ASSET_GROUPS_CONFIG\n"
         "  }\n"
         "};\n"
+        "var currentNetwork = localStorage.getItem('gtradeNetwork') || 'mainnet';\n"
+        "var GTRADE_CONFIG = GTRADE_NETWORKS[currentNetwork] || GTRADE_NETWORKS.mainnet;\n"
+        "\n"
+        "/* Chainlink Price Feed Addresses (Arbitrum One) — same oracles gTrade uses */\n"
+        "var CHAINLINK_FEEDS = {\n"
+        "  'BTC': '0x6ce185860a4963106506C203335A2910413708e9',\n"
+        "  'ETH': '0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612',\n"
+        "  'SOL': '0x24ceA4b8ce57cdA5058b924B9B9987992450590c',\n"
+        "  'AAPL': '0xc4A750B3E14bEF69Db22F2f5AaEEb77b6d1A4E42',\n"
+        "  'TSLA': '0x3609baAa0a9b1F0FE4B300b15BCa8bBdB8C22E66',\n"
+        "  'GOOGL': '0x1D1a83331e9D255EB1Aaf75026B60dFD00A252ba',\n"
+        "  'NVDA': '0x4881A4418b5F2460B21d6F08CD5aA0678a7f262F',\n"
+        "  'SPY': '0x46306F3795342117721D8DEd50fbcE4eFbee0aBe',\n"
+        "  'XAU': '0x1F954Dc24a49708C26E0C1777f16750B5C6d5a2c'\n"
+        "};\n"
+        "\n"
+        "async function fetchChainlinkPrice(feedAddr, provider) {\n"
+        "  if (!feedAddr || !provider || GTRADE_CONFIG.isTestnet) return null;\n"
+        "  try {\n"
+        "    var feedAbi = ['function latestRoundData() view returns (uint80,int256,uint256,uint256,uint80)'];\n"
+        "    var feed = new ethers.Contract(feedAddr, feedAbi, provider);\n"
+        "    var roundData = await feed.latestRoundData();\n"
+        "    return Number(roundData[1]) / 1e8;\n"
+        "  } catch (_) { return null; }\n"
+        "}\n"
         "\n"
         "function getAssetLimits(asset) {\n"
         "  var groups = GTRADE_CONFIG.assetGroups;\n"
         "  for (var g in groups) {\n"
         "    if (groups[g].assets.indexOf(asset) !== -1) return groups[g];\n"
         "  }\n"
-        "  return { minLeverage: 1.1, maxLeverage: 50 };\n"
+        "  return { minLeverage: 2, maxLeverage: 150 };\n"
         "}\n"
         "\n"
+        "/* Updated ABI matching current gTrade v9 ITradingStorage.Trade struct */\n"
         "var DIAMOND_ABI = [\n"
-        "  'function openTrade((address user, uint32 index, uint16 pairIndex, uint24 leverage, bool long, bool isOpen, uint8 collateralIndex, uint8 tradeType, uint120 collateralAmount, uint64 openPrice, uint64 tp, uint64 sl, uint192 __placeholder) _trade, uint16 _maxSlippageP, address _referrer)'\n"
+        "  'function openTrade(' +\n"
+        "    'tuple(address user, uint32 index, uint16 pairIndex, uint24 leverage, ' +\n"
+        "    'bool long, bool isOpen, uint8 collateralIndex, uint8 tradeType, ' +\n"
+        "    'uint120 collateralAmount, uint64 openPrice, uint64 tp, uint64 sl, ' +\n"
+        "    'bool isCounterTrade, uint160 positionSizeToken, uint24 __placeholder) _trade, ' +\n"
+        "    'uint16 _maxSlippageP, address _referrer)'\n"
         "];\n"
         "\n"
         "var ERC20_ABI = [\n"
@@ -1064,19 +1340,25 @@ def generate_dashboard_html(client) -> str:
         "  var btnText = document.getElementById('wallet-btn-text');\n"
         "  var overlay = document.getElementById('trade-connect-overlay');\n"
         "  var form = document.getElementById('trade-form-container');\n"
+        "  var posContainer = document.getElementById('positions-container');\n"
         "  if (walletState.connected) {\n"
         "    btn.className = 'wallet-btn connected';\n"
+        "    var badgeClass = GTRADE_CONFIG.isTestnet ? 'wallet-network-badge testnet' : 'wallet-network-badge';\n"
         "    btnText.innerHTML = '<span class=\"wallet-dot\"></span>' +\n"
-        "      '<span class=\"wallet-network-badge\">Arbitrum</span>' +\n"
+        "      '<span class=\"' + badgeClass + '\">' + GTRADE_CONFIG.networkLabel + '</span>' +\n"
         "      '<span class=\"wallet-address\">' + truncateAddress(walletState.address) + '</span>';\n"
         "    if (overlay) overlay.style.display = 'none';\n"
         "    if (form) form.style.display = 'block';\n"
+        "    if (posContainer) posContainer.style.display = 'block';\n"
         "    fetchUsdcBalance();\n"
+        "    loadOpenTrades();\n"
+        "    loadTradeHistory();\n"
         "  } else {\n"
         "    btn.className = 'wallet-btn';\n"
         "    btnText.textContent = 'Connect Wallet';\n"
         "    if (overlay) overlay.style.display = 'block';\n"
         "    if (form) form.style.display = 'none';\n"
+        "    if (posContainer) posContainer.style.display = 'none';\n"
         "  }\n"
         "}\n"
         "\n"
@@ -1098,7 +1380,7 @@ def generate_dashboard_html(client) -> str:
         "    await provider.send('eth_requestAccounts', []);\n"
         "    var network = await provider.getNetwork();\n"
         "    if (Number(network.chainId) !== GTRADE_CONFIG.chainId) {\n"
-        "      await switchToArbitrum();\n"
+        "      await switchToTargetChain();\n"
         "      provider = new ethers.BrowserProvider(window.ethereum);\n"
         "    }\n"
         "    var signer = await provider.getSigner();\n"
@@ -1110,12 +1392,12 @@ def generate_dashboard_html(client) -> str:
         "    updateWalletUI();\n"
         "    showToast('Connected: ' + truncateAddress(walletState.address), 'success');\n"
         "  } catch (err) {\n"
-        "    var rejected = err.code === 4001 || (err.info && err.info.error && err.info.error.code === 4001);\n"
-        "    showToast(rejected ? 'Connection rejected by user' : 'Connection failed: ' + (err.shortMessage || err.message), 'error');\n"
+        "    if (err.code === 4001 || err.code === 'ACTION_REJECTED' || (err.info && err.info.error && err.info.error.code === 4001)) return;\n"
+        "    showToast('Connection failed: ' + (err.shortMessage || err.message), 'error');\n"
         "  }\n"
         "}\n"
         "\n"
-        "async function switchToArbitrum() {\n"
+        "async function switchToTargetChain() {\n"
         "  try {\n"
         "    await window.ethereum.request({\n"
         "      method: 'wallet_switchEthereumChain',\n"
@@ -1150,6 +1432,8 @@ def generate_dashboard_html(client) -> str:
         "    } else if (walletState.connected) {\n"
         "      walletState.address = accounts[0];\n"
         "      updateWalletUI();\n"
+        "      loadOpenTrades();\n"
+        "      loadTradeHistory();\n"
         "      showToast('Account changed: ' + truncateAddress(accounts[0]), 'info');\n"
         "    }\n"
         "  });\n"
@@ -1157,7 +1441,13 @@ def generate_dashboard_html(client) -> str:
         "    var newChainId = parseInt(chainIdHex, 16);\n"
         "    walletState.chainId = newChainId;\n"
         "    if (newChainId !== GTRADE_CONFIG.chainId && walletState.connected) {\n"
-        "      showToast('Wrong network. Please switch to Arbitrum for trading.', 'error', 8000);\n"
+        "      var otherNet = currentNetwork === 'mainnet' ? 'testnet' : 'mainnet';\n"
+        "      if (newChainId === GTRADE_NETWORKS[otherNet].chainId) {\n"
+        "        document.getElementById('network-toggle').checked = (otherNet === 'testnet');\n"
+        "        switchNetwork(otherNet);\n"
+        "      } else {\n"
+        "        showToast('Wrong network. Please switch to ' + GTRADE_CONFIG.chainName + '.', 'error', 8000);\n"
+        "      }\n"
         "    } else if (newChainId === GTRADE_CONFIG.chainId && walletState.connected) {\n"
         "      handleWalletConnect();\n"
         "    }\n"
@@ -1168,17 +1458,64 @@ def generate_dashboard_html(client) -> str:
         "  }).catch(function() {});\n"
         "}\n"
         "\n"
+        "/* ========== Network Toggle ========== */\n"
+        "function switchNetwork(networkName) {\n"
+        "  if (networkName === currentNetwork) return;\n"
+        "  currentNetwork = networkName;\n"
+        "  GTRADE_CONFIG = GTRADE_NETWORKS[currentNetwork];\n"
+        "  localStorage.setItem('gtradeNetwork', currentNetwork);\n"
+        "  var banner = document.getElementById('testnet-banner');\n"
+        "  if (banner) banner.style.display = GTRADE_CONFIG.isTestnet ? 'block' : 'none';\n"
+        "  document.getElementById('network-label').textContent = GTRADE_CONFIG.isTestnet ? 'Testnet' : 'Mainnet';\n"
+        "  var netInfo = document.getElementById('trade-network-info');\n"
+        "  if (netInfo) netInfo.textContent = 'Network: ' + GTRADE_CONFIG.chainName;\n"
+        "  var colInfo = document.getElementById('trade-collateral-info');\n"
+        "  if (colInfo) colInfo.textContent = 'Collateral: ' + GTRADE_CONFIG.collateralSymbol;\n"
+        "  var colLabel = document.getElementById('trade-collateral-label');\n"
+        "  if (colLabel) {\n"
+        "    var balSpan = document.getElementById('trade-balance');\n"
+        "    colLabel.innerHTML = 'Collateral (' + GTRADE_CONFIG.collateralSymbol + ') ';\n"
+        "    if (balSpan) colLabel.appendChild(balSpan);\n"
+        "  }\n"
+        "  if (walletState.connected) {\n"
+        "    switchToTargetChain().then(function() {\n"
+        "      walletState.provider = new ethers.BrowserProvider(window.ethereum);\n"
+        "      return walletState.provider.getSigner();\n"
+        "    }).then(function(signer) {\n"
+        "      walletState.signer = signer;\n"
+        "      walletState.chainId = GTRADE_CONFIG.chainId;\n"
+        "      updateWalletUI();\n"
+        "    }).catch(function() {});\n"
+        "  } else {\n"
+        "    updateWalletUI();\n"
+        "  }\n"
+        "}\n"
+        "\n"
+        "// Initialize toggle state from localStorage\n"
+        "(function() {\n"
+        "  var toggle = document.getElementById('network-toggle');\n"
+        "  if (currentNetwork === 'testnet') {\n"
+        "    toggle.checked = true;\n"
+        "    var banner = document.getElementById('testnet-banner');\n"
+        "    if (banner) banner.style.display = 'block';\n"
+        "    document.getElementById('network-label').textContent = 'Testnet';\n"
+        "  }\n"
+        "  toggle.addEventListener('change', function() {\n"
+        "    switchNetwork(this.checked ? 'testnet' : 'mainnet');\n"
+        "  });\n"
+        "})();\n"
+        "\n"
         "/* ========== Trade Execution ========== */\n"
         "var tradePending = false;\n"
         "\n"
         "async function fetchUsdcBalance() {\n"
         "  if (!walletState.connected) return;\n"
         "  try {\n"
-        "    var usdc = new ethers.Contract(GTRADE_CONFIG.usdcAddress, ERC20_ABI, walletState.provider);\n"
+        "    var usdc = new ethers.Contract(GTRADE_CONFIG.collateralAddress, ERC20_ABI, walletState.provider);\n"
         "    var balance = await usdc.balanceOf(walletState.address);\n"
         "    var el = document.getElementById('trade-balance');\n"
         "    if (el) {\n"
-        "      el.textContent = 'Balance: ' + parseFloat(ethers.formatUnits(balance, GTRADE_CONFIG.usdcDecimals)).toFixed(2) + ' USDC';\n"
+        "      el.textContent = 'Balance: ' + parseFloat(ethers.formatUnits(balance, GTRADE_CONFIG.collateralDecimals)).toFixed(2) + ' ' + GTRADE_CONFIG.collateralSymbol;\n"
         "    }\n"
         "  } catch (e) {\n"
         "    var el = document.getElementById('trade-balance');\n"
@@ -1201,6 +1538,14 @@ def generate_dashboard_html(client) -> str:
         "  if (positionSize < GTRADE_CONFIG.minPositionSizeUsd && collateral > 0) {\n"
         "    errs.push('Min position size: $' + GTRADE_CONFIG.minPositionSizeUsd.toLocaleString());\n"
         "  }\n"
+        "  var tp = parseFloat(document.getElementById('trade-tp').value) || 0;\n"
+        "  var sl = parseFloat(document.getElementById('trade-sl').value) || 0;\n"
+        "  if (tp > 0 && tp > 900 / leverage) {\n"
+        "    errs.push('Max TP at ' + leverage + 'x: ' + (900 / leverage).toFixed(2) + '%');\n"
+        "  }\n"
+        "  if (sl > 0 && sl > 75 / leverage) {\n"
+        "    errs.push('Max SL at ' + leverage + 'x: ' + (75 / leverage).toFixed(2) + '%');\n"
+        "  }\n"
         "  return errs;\n"
         "}\n"
         "\n"
@@ -1208,17 +1553,59 @@ def generate_dashboard_html(client) -> str:
         "  var collateral = parseFloat(document.getElementById('trade-collateral').value) || 0;\n"
         "  var leverage = parseInt(document.getElementById('trade-leverage').value) || 15;\n"
         "  var positionSize = collateral * leverage;\n"
+        "  var fmt = function(n) { return n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }); };\n"
         "  var el = document.getElementById('trade-position-size');\n"
-        "  el.textContent = '$' + positionSize.toLocaleString(undefined, {\n"
-        "    minimumFractionDigits: 2, maximumFractionDigits: 2\n"
-        "  });\n"
+        "  el.textContent = '$' + fmt(positionSize);\n"
         "  el.className = positionSize > 0 && positionSize < GTRADE_CONFIG.minPositionSizeUsd\n"
         "    ? 'trade-position-size warning' : 'trade-position-size';\n"
         "  var errs = validateTradeInputs();\n"
         "  document.getElementById('trade-collateral-error').textContent =\n"
         "    errs.length > 0 && collateral > 0 ? errs[0] : '';\n"
-        "  document.getElementById('trade-submit-btn').disabled =\n"
-        "    !walletState.connected || errs.length > 0 || tradePending;\n"
+        "\n"
+        "  // Trade preview\n"
+        "  var preview = document.getElementById('trade-preview');\n"
+        "  if (collateral > 0 && currentTradeAsset) {\n"
+        "    var isLong = document.getElementById('trade-dir-long').classList.contains('active');\n"
+        "    var dir = isLong ? 'LONG' : 'SHORT';\n"
+        "    var dirClass = isLong ? 'positive' : 'negative';\n"
+        "    var price = currentAssets[currentTradeAsset] ? currentAssets[currentTradeAsset].current_price : 0;\n"
+        "    var tp = parseFloat(document.getElementById('trade-tp').value) || 0;\n"
+        "    var sl = parseFloat(document.getElementById('trade-sl').value) || 0;\n"
+        "    var slippage = parseFloat(document.getElementById('trade-slippage').value) || 1;\n"
+        "    var html = '<div class=\"preview-row\"><span>Direction</span><span class=\"' + dirClass + '\">' + dir + ' ' + leverage + 'x</span></div>';\n"
+        "    html += '<div class=\"preview-row\"><span>Position Size</span><span>$' + fmt(positionSize) + '</span></div>';\n"
+        "    if (price > 0) html += '<div class=\"preview-row\"><span>Entry Price</span><span>$' + fmt(price) + ' (market)</span></div>';\n"
+        "    html += '<div class=\"preview-row\"><span>Collateral</span><span>' + fmt(collateral) + ' ' + GTRADE_CONFIG.collateralSymbol + '</span></div>';\n"
+        "    var maxTpPct = (900 / leverage).toFixed(2);\n"
+        "    var maxSlPct = (75 / leverage).toFixed(2);\n"
+        "    if (tp > 0) html += '<div class=\"preview-row\"><span>Take Profit</span><span class=\"' + (tp > 900/leverage ? 'negative' : 'positive') + '\">' + tp + '% (max ' + maxTpPct + '%)</span></div>';\n"
+        "    if (sl > 0) html += '<div class=\"preview-row\"><span>Stop Loss</span><span class=\"' + (sl > 75/leverage ? 'negative' : 'negative') + '\">' + sl + '% (max ' + maxSlPct + '%)</span></div>';\n"
+        "    html += '<div class=\"preview-row\"><span>Max Slippage</span><span>' + slippage.toFixed(1) + '%</span></div>';\n"
+        "    html += '<div class=\"preview-row\"><span>Protocol</span><span>gTrade &middot; ' + GTRADE_CONFIG.chainName + '</span></div>';\n"
+        "    preview.innerHTML = html;\n"
+        "    preview.style.display = 'block';\n"
+        "  } else {\n"
+        "    preview.style.display = 'none';\n"
+        "  }\n"
+        "\n"
+        "  // Submit button with descriptive disable reason\n"
+        "  var submitBtn = document.getElementById('trade-submit-btn');\n"
+        "  if (!walletState.connected) {\n"
+        "    submitBtn.disabled = true;\n"
+        "    submitBtn.textContent = 'Connect Wallet';\n"
+        "  } else if (tradePending) {\n"
+        "    submitBtn.disabled = true;\n"
+        "  } else if (errs.length > 0) {\n"
+        "    submitBtn.disabled = true;\n"
+        "    submitBtn.textContent = errs[0];\n"
+        "  } else if (collateral <= 0) {\n"
+        "    submitBtn.disabled = true;\n"
+        "    submitBtn.textContent = 'Enter Collateral';\n"
+        "  } else {\n"
+        "    submitBtn.disabled = false;\n"
+        "    var isLong = document.getElementById('trade-dir-long').classList.contains('active');\n"
+        "    submitBtn.textContent = 'Open ' + (isLong ? 'Long' : 'Short') + ' ' + currentTradeAsset;\n"
+        "  }\n"
         "}\n"
         "\n"
         "async function submitTrade() {\n"
@@ -1234,21 +1621,57 @@ def generate_dashboard_html(client) -> str:
         "\n"
         "  // Server-side validation\n"
         "  try {\n"
+        "    var direction = isLong ? 'long' : 'short';\n"
         "    var valResp = await fetch('/api/gtrade/validate-trade', {\n"
         "      method: 'POST',\n"
         "      headers: { 'Content-Type': 'application/json' },\n"
-        "      body: JSON.stringify({ asset: asset, collateral: collateral, leverage: leverage, slippage: slippage })\n"
+        "      body: JSON.stringify({ asset: asset, direction: direction, leverage: leverage, collateral_usd: collateral })\n"
         "    });\n"
         "    var valData = await valResp.json();\n"
-        "    if (!valData.valid) { showToast(valData.errors[0], 'error'); return; }\n"
-        "    var pairIndex = valData.pair_index;\n"
+        "    if (!valData.valid) { showToast(valData.error, 'error'); return; }\n"
         "  } catch (valErr) {\n"
         "    showToast('Validation failed: ' + valErr.message, 'error');\n"
         "    return;\n"
         "  }\n"
         "\n"
+        "  // Fetch live price from Chainlink on-chain feed (same oracle gTrade uses)\n"
+        "  var currentPrice = 0;\n"
+        "  var feedAddr = CHAINLINK_FEEDS[asset];\n"
+        "  if (feedAddr && walletState.provider) {\n"
+        "    var clPrice = await fetchChainlinkPrice(feedAddr, walletState.provider);\n"
+        "    if (clPrice) currentPrice = clPrice;\n"
+        "  }\n"
+        "  if (!currentPrice) {\n"
+        "    currentPrice = currentAssets[asset] ? currentAssets[asset].current_price : 0;\n"
+        "  }\n"
+        "  if (!currentPrice || currentPrice <= 0) {\n"
+        "    showToast('No market price available for ' + asset + '. Try again.', 'error');\n"
+        "    return;\n"
+        "  }\n"
+        "  var openPriceScaled = BigInt(Math.round(currentPrice * 1e10));\n"
+        "\n"
         "  var tpPercent = parseFloat(document.getElementById('trade-tp').value) || 0;\n"
         "  var slPercent = parseFloat(document.getElementById('trade-sl').value) || 0;\n"
+        "  var maxTpDist = 900 / leverage;\n"
+        "  var maxSlDist = 75 / leverage;\n"
+        "  if (tpPercent > maxTpDist) {\n"
+        "    showToast('Max TP at ' + leverage + 'x is ' + maxTpDist.toFixed(2) + '% (900%/leverage)', 'error');\n"
+        "    return;\n"
+        "  }\n"
+        "  if (slPercent > maxSlDist) {\n"
+        "    showToast('Max SL at ' + leverage + 'x is ' + maxSlDist.toFixed(2) + '% (75%/leverage)', 'error');\n"
+        "    return;\n"
+        "  }\n"
+        "  var tpScaled = BigInt(0);\n"
+        "  var slScaled = BigInt(0);\n"
+        "  if (isLong) {\n"
+        "    if (tpPercent > 0) tpScaled = BigInt(Math.round(currentPrice * (1 + tpPercent / 100) * 1e10));\n"
+        "    if (slPercent > 0) slScaled = BigInt(Math.round(currentPrice * (1 - slPercent / 100) * 1e10));\n"
+        "  } else {\n"
+        "    if (tpPercent > 0) tpScaled = BigInt(Math.round(currentPrice * (1 - tpPercent / 100) * 1e10));\n"
+        "    if (slPercent > 0) slScaled = BigInt(Math.round(currentPrice * (1 + slPercent / 100) * 1e10));\n"
+        "  }\n"
+        "\n"
         "  tradePending = true;\n"
         "  var submitBtn = document.getElementById('trade-submit-btn');\n"
         "  var originalText = submitBtn.textContent;\n"
@@ -1259,59 +1682,74 @@ def generate_dashboard_html(client) -> str:
         "    // Ensure correct network\n"
         "    var network = await walletState.provider.getNetwork();\n"
         "    if (Number(network.chainId) !== GTRADE_CONFIG.chainId) {\n"
-        "      showToast('Switching to Arbitrum...', 'info', 3000);\n"
-        "      await switchToArbitrum();\n"
+        "      showToast('Switching to ' + GTRADE_CONFIG.chainName + '...', 'info', 3000);\n"
+        "      await switchToTargetChain();\n"
         "      walletState.provider = new ethers.BrowserProvider(window.ethereum);\n"
         "      walletState.signer = await walletState.provider.getSigner();\n"
         "    }\n"
         "\n"
-        "    // Check USDC approval\n"
-        "    var collateralWei = ethers.parseUnits(collateral.toString(), GTRADE_CONFIG.usdcDecimals);\n"
-        "    var usdc = new ethers.Contract(GTRADE_CONFIG.usdcAddress, ERC20_ABI, walletState.signer);\n"
-        "    var allowance = await usdc.allowance(walletState.address, GTRADE_CONFIG.diamondAddress);\n"
+        "    // Check collateral approval\n"
+        "    var collateralWei = ethers.parseUnits(collateral.toString(), GTRADE_CONFIG.collateralDecimals);\n"
+        "    var colToken = new ethers.Contract(GTRADE_CONFIG.collateralAddress, ERC20_ABI, walletState.signer);\n"
+        "    var allowance = await colToken.allowance(walletState.address, GTRADE_CONFIG.diamondAddress);\n"
         "    if (allowance < collateralWei) {\n"
-        "      showToast('Approving USDC...', 'info', 10000);\n"
-        "      submitBtn.textContent = 'Approving USDC...';\n"
-        "      var approveTx = await usdc.approve(GTRADE_CONFIG.diamondAddress, ethers.MaxUint256);\n"
+        "      showToast('Approving ' + GTRADE_CONFIG.collateralSymbol + '...', 'info', 10000);\n"
+        "      submitBtn.textContent = 'Approving ' + GTRADE_CONFIG.collateralSymbol + '...';\n"
+        "      var approveTx = await colToken.approve(GTRADE_CONFIG.diamondAddress, ethers.MaxUint256);\n"
         "      await approveTx.wait();\n"
-        "      showToast('USDC approved', 'success', 3000);\n"
+        "      showToast(GTRADE_CONFIG.collateralSymbol + ' approved', 'success', 3000);\n"
         "    }\n"
         "\n"
-        "    // Build trade struct\n"
-        "    var currentPrice = currentAssets[asset] ? currentAssets[asset].current_price : 0;\n"
-        "    var tpPrice = tpPercent > 0\n"
-        "      ? BigInt(Math.round(currentPrice * (1 + (isLong ? tpPercent : -tpPercent) / 100) * 1e10))\n"
-        "      : 0n;\n"
-        "    var slPrice = slPercent > 0\n"
-        "      ? BigInt(Math.round(currentPrice * (1 + (isLong ? -slPercent : slPercent) / 100) * 1e10))\n"
-        "      : 0n;\n"
+        "    // Resolve pair index dynamically from gTrade API\n"
+        "    var pairResp = await fetch('/api/gtrade/resolve-pair?asset=' + asset + '&network=' + currentNetwork);\n"
+        "    var pairData = await pairResp.json();\n"
+        "    if (pairData.pair_index === null || pairData.pair_index === undefined) {\n"
+        "      showToast('Could not resolve gTrade pair index for ' + asset + '. Try again later.', 'error');\n"
+        "      return;\n"
+        "    }\n"
+        "\n"
+        "    // Build trade struct matching ITradingStorage.Trade on-chain\n"
+        "    var leverageScaled = Math.round(leverage * 1000);\n"
+        "    var slippageP = Math.round(slippage * 1000);\n"
         "    var trade = {\n"
-        "      user: walletState.address, index: 0, pairIndex: pairIndex,\n"
-        "      leverage: leverage * 1000, long: isLong, isOpen: true,\n"
-        "      collateralIndex: GTRADE_CONFIG.collateralIndex, tradeType: 0,\n"
-        "      collateralAmount: collateralWei, openPrice: 0,\n"
-        "      tp: tpPrice, sl: slPrice, __placeholder: 0\n"
+        "      user: walletState.address,\n"
+        "      index: 0,\n"
+        "      pairIndex: pairData.pair_index,\n"
+        "      leverage: leverageScaled,\n"
+        "      long: isLong,\n"
+        "      isOpen: false,\n"
+        "      collateralIndex: GTRADE_CONFIG.collateralIndex,\n"
+        "      tradeType: 0,\n"
+        "      collateralAmount: collateralWei,\n"
+        "      openPrice: openPriceScaled,\n"
+        "      tp: tpScaled,\n"
+        "      sl: slScaled,\n"
+        "      isCounterTrade: false,\n"
+        "      positionSizeToken: BigInt(0),\n"
+        "      __placeholder: 0\n"
         "    };\n"
         "\n"
         "    // Submit trade\n"
         "    showToast('Opening ' + (isLong ? 'long' : 'short') + ' ' + asset + '...', 'info', 15000);\n"
         "    submitBtn.textContent = 'Opening Trade...';\n"
         "    var diamond = new ethers.Contract(GTRADE_CONFIG.diamondAddress, DIAMOND_ABI, walletState.signer);\n"
-        "    var tx = await diamond.openTrade(trade, Math.round(slippage * 1000), ethers.ZeroAddress);\n"
+        "    var tx = await diamond.openTrade(trade, slippageP, ethers.ZeroAddress, { gasLimit: 3000000 });\n"
         "    showToast('Transaction submitted. Waiting for confirmation...', 'info', 20000);\n"
         "    var receipt = await tx.wait();\n"
         "    showToast('Trade opened! <a href=\"' + GTRADE_CONFIG.explorerUrl + '/tx/' + receipt.hash +\n"
-        "      '\" target=\"_blank\" rel=\"noopener\">View on Arbiscan</a>', 'success', 10000);\n"
+        "      '\" target=\"_blank\" rel=\"noopener\">View on Explorer</a>', 'success', 10000);\n"
         "    fetchUsdcBalance();\n"
+        "    pollOpenTrades(5, 3000);\n"
         "  } catch (err) {\n"
-        "    var msg = err.shortMessage || err.message || 'Transaction failed';\n"
-        "    if (err.code === 4001 || (err.info && err.info.error && err.info.error.code === 4001)) {\n"
-        "      msg = 'Transaction rejected by user';\n"
-        "    } else if (msg.toLowerCase().includes('insufficient')) {\n"
-        "      msg = 'Insufficient funds (check USDC balance and ETH for gas)';\n"
-        "    } else if (msg.toLowerCase().includes('market') || msg.toLowerCase().includes('closed')) {\n"
+        "    var msg = err.reason || err.shortMessage || err.message || 'Transaction failed';\n"
+        "    if (err.code === 4001 || err.code === 'ACTION_REJECTED' || (err.info && err.info.error && err.info.error.code === 4001)) {\n"
+        "      return;\n"
+        "    } else if (msg.toLowerCase().indexOf('insufficient') !== -1) {\n"
+        "      msg = 'Insufficient funds (check ' + GTRADE_CONFIG.collateralSymbol + ' balance and ETH for gas)';\n"
+        "    } else if (msg.toLowerCase().indexOf('market') !== -1 || msg.toLowerCase().indexOf('closed') !== -1) {\n"
         "      msg = 'Market may be closed. Equity markets trade during US hours.';\n"
         "    }\n"
+        "    if (msg.length > 150) msg = msg.slice(0, 150) + '...';\n"
         "    msg += ' <a href=\"https://gains.trade/trading\" target=\"_blank\" rel=\"noopener\">Try on gTrade</a>';\n"
         "    showToast(msg, 'error', 8000);\n"
         "  } finally {\n"
@@ -1325,7 +1763,10 @@ def generate_dashboard_html(client) -> str:
         "var currentTradeAsset = null;\n"
         "\n"
         "function openTradePanel(asset) {\n"
-        "  if (GTRADE_CONFIG.pairIndices[asset] === undefined) return;\n"
+        "  var groups = GTRADE_CONFIG.assetGroups;\n"
+        "  var found = false;\n"
+        "  for (var g in groups) { if (groups[g].assets.indexOf(asset) !== -1) { found = true; break; } }\n"
+        "  if (!found) return;\n"
         "  currentTradeAsset = asset;\n"
         "  document.getElementById('trade-asset-label').textContent = asset;\n"
         "  document.getElementById('trade-panel').classList.add('visible');\n"
@@ -1377,6 +1818,234 @@ def generate_dashboard_html(client) -> str:
         "  currentTradeAsset = null;\n"
         "}\n"
         "\n"
+        "/* ========== Open Positions & Trade History ========== */\n"
+        "var pairIndexToTicker = {};\n"
+        "var _openTradesCache = {};\n"
+        "var TRADE_HISTORY_KEY = 'tidechart_trade_history';\n"
+        "\n"
+        "function getTradeHistory() {\n"
+        "  try { var raw = localStorage.getItem(TRADE_HISTORY_KEY); return raw ? JSON.parse(raw) : []; }\n"
+        "  catch (_) { return []; }\n"
+        "}\n"
+        "function saveTradeToHistory(entry) {\n"
+        "  var history = getTradeHistory();\n"
+        "  history.unshift(entry);\n"
+        "  if (history.length > 50) history = history.slice(0, 50);\n"
+        "  try { localStorage.setItem(TRADE_HISTORY_KEY, JSON.stringify(history)); } catch (_) {}\n"
+        "}\n"
+        "\n"
+        "function resolveFeedForPairIndex(pairIndex, pairNames) {\n"
+        "  if (pairIndexToTicker[pairIndex]) return CHAINLINK_FEEDS[pairIndexToTicker[pairIndex]] || null;\n"
+        "  var name = pairNames[pairIndex];\n"
+        "  if (!name) return null;\n"
+        "  var ticker = name.split('/')[0];\n"
+        "  if (ticker) pairIndexToTicker[pairIndex] = ticker;\n"
+        "  return CHAINLINK_FEEDS[ticker] || null;\n"
+        "}\n"
+        "\n"
+        "function pollOpenTrades(attempts, intervalMs) {\n"
+        "  var count = 0;\n"
+        "  loadOpenTrades(); loadTradeHistory();\n"
+        "  var timer = setInterval(function() {\n"
+        "    count++;\n"
+        "    loadOpenTrades(); loadTradeHistory(); fetchUsdcBalance();\n"
+        "    if (count >= attempts) clearInterval(timer);\n"
+        "  }, intervalMs);\n"
+        "}\n"
+        "\n"
+        "async function loadOpenTrades() {\n"
+        "  if (!walletState.connected) return;\n"
+        "  var container = document.getElementById('open-trades-list');\n"
+        "  if (!container) return;\n"
+        "  try {\n"
+        "    var resp = await fetch('/api/gtrade/open-trades?address=' + walletState.address + '&network=' + currentNetwork);\n"
+        "    var data = await resp.json();\n"
+        "    var trades = data.trades || [];\n"
+        "    var pairNames = data.pair_names || {};\n"
+        "    if (trades.length === 0) {\n"
+        "      container.innerHTML = '<div class=\"no-trades\">No open positions</div>';\n"
+        "      return;\n"
+        "    }\n"
+        "    Object.keys(pairNames).forEach(function(idx) {\n"
+        "      var ticker = pairNames[idx].split('/')[0];\n"
+        "      if (ticker) pairIndexToTicker[idx] = ticker;\n"
+        "    });\n"
+        "    var uniquePairs = {};\n"
+        "    trades.forEach(function(item) {\n"
+        "      var t = item.trade || item;\n"
+        "      uniquePairs[parseInt(t.pairIndex || '0')] = true;\n"
+        "    });\n"
+        "    var livePrices = {};\n"
+        "    if (walletState.provider) {\n"
+        "      var pricePromises = Object.keys(uniquePairs).map(async function(pairIdx) {\n"
+        "        var feedAddr = resolveFeedForPairIndex(parseInt(pairIdx), pairNames);\n"
+        "        if (feedAddr) {\n"
+        "          var price = await fetchChainlinkPrice(feedAddr, walletState.provider);\n"
+        "          if (price) livePrices[pairIdx] = price;\n"
+        "        }\n"
+        "      });\n"
+        "      await Promise.all(pricePromises);\n"
+        "    }\n"
+        "    if (typeof currentAssets !== 'undefined') {\n"
+        "      Object.keys(uniquePairs).forEach(function(pairIdx) {\n"
+        "        if (!livePrices[pairIdx]) {\n"
+        "          var ticker = pairIndexToTicker[pairIdx];\n"
+        "          if (ticker && currentAssets[ticker] && currentAssets[ticker].current_price)\n"
+        "            livePrices[pairIdx] = currentAssets[ticker].current_price;\n"
+        "        }\n"
+        "      });\n"
+        "    }\n"
+        "    _openTradesCache = {};\n"
+        "    var html = '';\n"
+        "    trades.forEach(function(item) {\n"
+        "      var t = item.trade || item;\n"
+        "      var pairIdx = parseInt(t.pairIndex || '0');\n"
+        "      var tradeIdx = parseInt(t.index || '0');\n"
+        "      var dir = t.long ? 'LONG' : 'SHORT';\n"
+        "      var dirClass = t.long ? 'positive' : 'negative';\n"
+        "      var pairLabel = pairNames[pairIdx] || ('Pair #' + pairIdx);\n"
+        "      var lev = t.leverage ? (parseFloat(t.leverage) / 1000).toFixed(0) + 'x' : '?x';\n"
+        "      var levNum = t.leverage ? parseFloat(t.leverage) / 1000 : 0;\n"
+        "      _openTradesCache[tradeIdx] = { pairIdx: pairIdx, pairLabel: pairLabel, dir: dir, lev: lev,\n"
+        "        long: t.long, leverage: t.leverage, collateralAmount: t.collateralAmount,\n"
+        "        collateralIndex: t.collateralIndex, openPrice: t.openPrice };\n"
+        "      var colRaw = BigInt(t.collateralAmount || '0');\n"
+        "      var colIdx = parseInt(t.collateralIndex || '3');\n"
+        "      var colDecimals = (colIdx === 3) ? 6 : 18;\n"
+        "      var col = Number(colRaw) / Math.pow(10, colDecimals);\n"
+        "      var entryPrice = t.openPrice ? parseFloat(t.openPrice) / 1e10 : 0;\n"
+        "      var entryFmt = entryPrice > 0 ? '$' + entryPrice.toFixed(2) : '?';\n"
+        "      var pnlHtml = '';\n"
+        "      var curPrice = livePrices[pairIdx];\n"
+        "      if (curPrice && entryPrice > 0 && levNum > 0) {\n"
+        "        var pnlPct = t.long\n"
+        "          ? ((curPrice - entryPrice) / entryPrice) * levNum * 100\n"
+        "          : ((entryPrice - curPrice) / entryPrice) * levNum * 100;\n"
+        "        var pnlUsd = col * (pnlPct / 100);\n"
+        "        var pnlClass = pnlUsd >= 0 ? 'positive' : 'negative';\n"
+        "        var pnlSign = pnlUsd >= 0 ? '+' : '';\n"
+        "        pnlHtml = '<span class=\"trade-pnl ' + pnlClass + '\">' +\n"
+        "          pnlSign + pnlUsd.toFixed(2) + ' ' + GTRADE_CONFIG.collateralSymbol + ' (' + pnlSign + pnlPct.toFixed(2) + '%)</span>';\n"
+        "      }\n"
+        "      html += '<div class=\"open-trade-row\">' +\n"
+        "        '<div class=\"trade-row-info\">' +\n"
+        "        '<div class=\"trade-row-main\">' +\n"
+        "        '<span class=\"' + dirClass + '\">' + dir + ' ' + lev + '</span>' +\n"
+        "        '<span>' + pairLabel + '</span>' +\n"
+        "        '<span>Entry: ' + entryFmt + (curPrice ? ' / Now: $' + curPrice.toFixed(2) : '') + '</span>' +\n"
+        "        '<span>' + col.toFixed(2) + ' ' + GTRADE_CONFIG.collateralSymbol + '</span></div>' +\n"
+        "        (pnlHtml ? '<div class=\"trade-row-pnl\">' + pnlHtml + '</div>' : '') +\n"
+        "        '</div>' +\n"
+        "        '<button class=\"close-trade-btn\" onclick=\"closeTrade(' + tradeIdx + ',' + pairIdx + ')\" title=\"Close position\">&#x2715;</button>' +\n"
+        "        '</div>';\n"
+        "    });\n"
+        "    container.innerHTML = html;\n"
+        "  } catch (e) {\n"
+        "    container.innerHTML = '<div class=\"no-trades\">Could not load trades</div>';\n"
+        "  }\n"
+        "}\n"
+        "\n"
+        "function loadTradeHistory() {\n"
+        "  var container = document.getElementById('trade-history-list');\n"
+        "  if (!container) return;\n"
+        "  var history = getTradeHistory();\n"
+        "  if (history.length === 0) {\n"
+        "    container.innerHTML = '<div class=\"no-trades\">No trade history</div>';\n"
+        "    return;\n"
+        "  }\n"
+        "  var html = '';\n"
+        "  history.forEach(function(h) {\n"
+        "    var dirClass = h.long ? 'positive' : 'negative';\n"
+        "    var pnlVal = parseFloat(h.pnlUsd || '0');\n"
+        "    var pnlPctVal = parseFloat(h.pnlPct || '0');\n"
+        "    var pnlClass = pnlVal >= 0 ? 'positive' : 'negative';\n"
+        "    var pnlSign = pnlVal >= 0 ? '+' : '';\n"
+        "    var pnlHtml = '<span class=\"trade-pnl ' + pnlClass + '\">' +\n"
+        "      pnlSign + pnlVal.toFixed(2) + ' ' + GTRADE_CONFIG.collateralSymbol + ' (' + pnlSign + pnlPctVal.toFixed(1) + '%)</span>';\n"
+        "    var txLink = h.txHash\n"
+        "      ? ' <a href=\"' + GTRADE_CONFIG.explorerUrl + '/tx/' + h.txHash + '\" target=\"_blank\" rel=\"noopener\" style=\"color:var(--accent);font-size:10px\">tx</a>'\n"
+        "      : '';\n"
+        "    html += '<div class=\"open-trade-row history-row\">' +\n"
+        "      '<div class=\"trade-row-info\">' +\n"
+        "      '<div class=\"trade-row-main\">' +\n"
+        "      '<span class=\"' + dirClass + '\">' + (h.dir || '?') + ' ' + (h.lev || '?x') + '</span>' +\n"
+        "      '<span>' + (h.pairLabel || '?') + '</span>' +\n"
+        "      '<span>Entry: $' + (h.entryPrice || '?') + ' / Close: $' + (h.closePrice || '?') + '</span>' +\n"
+        "      '<span>' + (h.collateral || '?') + ' ' + GTRADE_CONFIG.collateralSymbol + '</span></div>' +\n"
+        "      '<div class=\"trade-row-pnl\">' + pnlHtml + txLink + '</div></div>' +\n"
+        "      '<span class=\"history-badge\">CLOSED</span></div>';\n"
+        "  });\n"
+        "  container.innerHTML = html;\n"
+        "}\n"
+        "\n"
+        "async function closeTrade(tradeIndex, pairIndex) {\n"
+        "  if (!walletState.connected || !walletState.signer) { showToast('Connect wallet first', 'error'); return; }\n"
+        "  if (tradePending) { showToast('Transaction already in progress', 'error'); return; }\n"
+        "  tradePending = true;\n"
+        "  try {\n"
+        "    var feedAddr = resolveFeedForPairIndex(pairIndex, pairIndexToTicker);\n"
+        "    if (!feedAddr) {\n"
+        "      try {\n"
+        "        var prResp = await fetch('/api/gtrade/open-trades?address=' + walletState.address + '&network=' + currentNetwork);\n"
+        "        var prData = await prResp.json();\n"
+        "        feedAddr = resolveFeedForPairIndex(pairIndex, prData.pair_names || {});\n"
+        "      } catch (_) {}\n"
+        "    }\n"
+        "    var expectedPrice = BigInt(0);\n"
+        "    if (feedAddr && walletState.provider) {\n"
+        "      var livePrice = await fetchChainlinkPrice(feedAddr, walletState.provider);\n"
+        "      if (livePrice) expectedPrice = BigInt(Math.round(livePrice * 1e10));\n"
+        "    }\n"
+        "    if (expectedPrice === BigInt(0)) {\n"
+        "      var ticker = pairIndexToTicker[pairIndex];\n"
+        "      if (ticker && typeof currentAssets !== 'undefined' && currentAssets[ticker] && currentAssets[ticker].current_price)\n"
+        "        expectedPrice = BigInt(Math.round(currentAssets[ticker].current_price * 1e10));\n"
+        "    }\n"
+        "    if (expectedPrice === BigInt(0)) {\n"
+        "      showToast('Could not fetch live price. Try again.', 'error');\n"
+        "      tradePending = false; return;\n"
+        "    }\n"
+        "    var closeAbi = ['function closeTradeMarket(uint32 _index, uint64 _expectedPrice)'];\n"
+        "    var diamond = new ethers.Contract(GTRADE_CONFIG.diamondAddress, closeAbi, walletState.signer);\n"
+        "    showToast('Closing position...', 'info', 15000);\n"
+        "    var tx = await diamond.closeTradeMarket(tradeIndex, expectedPrice, { gasLimit: 3000000 });\n"
+        "    showToast('Close submitted. Waiting for confirmation...', 'info', 20000);\n"
+        "    var receipt = await tx.wait();\n"
+        "    showToast('Position closed! <a href=\"' + GTRADE_CONFIG.explorerUrl + '/tx/' + receipt.hash +\n"
+        "      '\" target=\"_blank\" rel=\"noopener\">View on Explorer</a>', 'success', 10000);\n"
+        "    var cached = _openTradesCache[tradeIndex] || {};\n"
+        "    var closePriceFloat = Number(expectedPrice) / 1e10;\n"
+        "    var entryP = cached.openPrice ? parseFloat(cached.openPrice) / 1e10 : 0;\n"
+        "    var levNum = cached.leverage ? parseFloat(cached.leverage) / 1000 : 0;\n"
+        "    var colIdx = parseInt(cached.collateralIndex || '3');\n"
+        "    var colDec = (colIdx === 3) ? 6 : 18;\n"
+        "    var colNum = cached.collateralAmount ? Number(BigInt(cached.collateralAmount)) / Math.pow(10, colDec) : 0;\n"
+        "    var pnlPct = 0;\n"
+        "    if (entryP > 0 && levNum > 0) {\n"
+        "      pnlPct = cached.long\n"
+        "        ? ((closePriceFloat - entryP) / entryP) * levNum * 100\n"
+        "        : ((entryP - closePriceFloat) / entryP) * levNum * 100;\n"
+        "    }\n"
+        "    saveTradeToHistory({\n"
+        "      pairLabel: cached.pairLabel || ('Pair #' + pairIndex), dir: cached.dir || '?',\n"
+        "      lev: cached.lev || '?x', long: !!cached.long, collateral: colNum.toFixed(2),\n"
+        "      entryPrice: entryP.toFixed(2), closePrice: closePriceFloat.toFixed(2),\n"
+        "      pnlUsd: (colNum * (pnlPct / 100)).toFixed(2), pnlPct: pnlPct.toFixed(1),\n"
+        "      txHash: receipt.hash, closedAt: new Date().toISOString()\n"
+        "    });\n"
+        "    fetchUsdcBalance();\n"
+        "    pollOpenTrades(5, 3000);\n"
+        "  } catch (e) {\n"
+        "    var msg = e.reason || e.shortMessage || e.message || 'Close trade failed';\n"
+        "    if (e.code === 4001 || e.code === 'ACTION_REJECTED' || (e.info && e.info.error && e.info.error.code === 4001))\n"
+        "      return;\n"
+        "    if (msg.length > 150) msg = msg.slice(0, 150) + '...';\n"
+        "    showToast(msg, 'error', 8000);\n"
+        "  } finally {\n"
+        "    tradePending = false;\n"
+        "  }\n"
+        "}\n"
+        "\n"
         "/* ========== Trade Panel Event Listeners ========== */\n"
         "document.querySelectorAll('.trade-dir-btn').forEach(function(btn) {\n"
         "  btn.addEventListener('click', function() {\n"
@@ -1394,11 +2063,19 @@ def generate_dashboard_html(client) -> str:
         "});\n"
         "\n"
         "document.getElementById('trade-leverage').addEventListener('input', function(e) {\n"
-        "  document.getElementById('trade-leverage-display').textContent = e.target.value + 'x';\n"
+        "  var lev = parseInt(e.target.value);\n"
+        "  document.getElementById('trade-leverage-display').textContent = lev + 'x';\n"
+        "  var tpH = document.getElementById('tp-hint');\n"
+        "  var slH = document.getElementById('sl-hint');\n"
+        "  if (tpH) tpH.textContent = 'max ' + (900 / lev).toFixed(2) + '%';\n"
+        "  if (slH) slH.textContent = 'max ' + (75 / lev).toFixed(2) + '%';\n"
         "  updatePositionSize();\n"
         "});\n"
         "\n"
         "document.getElementById('trade-collateral').addEventListener('input', updatePositionSize);\n"
+        "document.getElementById('trade-tp').addEventListener('input', updatePositionSize);\n"
+        "document.getElementById('trade-sl').addEventListener('input', updatePositionSize);\n"
+        "document.getElementById('trade-slippage').addEventListener('input', updatePositionSize);\n"
         "document.getElementById('trade-close-btn').addEventListener('click', closeTradePanel);\n"
         "document.getElementById('trade-submit-btn').addEventListener('click', submitTrade);\n"
         "document.getElementById('wallet-btn').addEventListener('click', handleWalletConnect);\n"
@@ -1483,15 +2160,52 @@ def create_app(client=None) -> Flask:
 
     @app.route("/api/gtrade/config")
     def api_gtrade_config():
-        return jsonify(GTRADE_CONFIG)
+        network = request.args.get("network", "mainnet")
+        if network not in GTRADE_NETWORKS:
+            network = "mainnet"
+        config = dict(GTRADE_CONFIG)
+        config.update(GTRADE_NETWORKS[network])
+        return jsonify(config)
 
     @app.route("/api/gtrade/validate-trade", methods=["POST"])
     def api_gtrade_validate():
         body = request.get_json(silent=True) or {}
-        errors = validate_trade_params(body)
-        if errors:
-            return jsonify({"valid": False, "errors": errors}), 400
-        return jsonify({"valid": True, "pair_index": GTRADE_CONFIG["pair_indices"][body["asset"]]})
+        asset = body.get("asset", "")
+        direction = body.get("direction", "")
+        leverage = body.get("leverage", 0)
+        collateral_usd = body.get("collateral_usd", 0)
+
+        valid, error = validate_trade_params(asset, direction, leverage, collateral_usd)
+        if not valid:
+            return jsonify({"valid": False, "error": error}), 400
+        return jsonify({"valid": True})
+
+    @app.route("/api/gtrade/resolve-pair")
+    def api_gtrade_resolve_pair():
+        asset = request.args.get("asset", "")
+        network = request.args.get("network", "mainnet")
+        if network not in GTRADE_NETWORKS:
+            network = "mainnet"
+        if asset not in GTRADE_PAIRS:
+            return jsonify({"error": f"{asset} not tradeable", "pair_index": None}), 400
+        try:
+            trading_vars = get_cached_trading_variables(network=network)
+        except Exception:
+            trading_vars = None
+        pair_index = resolve_pair_index(asset, trading_vars, network=network)
+        return jsonify({"asset": asset, "pair_index": pair_index})
+
+    @app.route("/api/gtrade/open-trades")
+    def api_gtrade_open_trades():
+        address = request.args.get("address", "").strip()
+        network = request.args.get("network", "mainnet")
+        if network not in GTRADE_NETWORKS:
+            network = "mainnet"
+        if not address or len(address) != 42 or not address.startswith("0x"):
+            return jsonify({"error": "Invalid Ethereum address", "trades": []}), 400
+        trades = fetch_open_trades(address, network=network)
+        pair_names = get_pair_name_map(network=network)
+        return jsonify({"address": address, "trades": trades, "pair_names": pair_names})
 
     return app
 
