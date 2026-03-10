@@ -3,6 +3,62 @@
  * via Gains Network on Arbitrum One.
  */
 
+/* ========== Chainlink Price Feed Addresses (Arbitrum One) ========== */
+var CHAINLINK_FEEDS = {
+  'BTC': '0x6ce185860a4963106506C203335A2910413708e9',
+  'ETH': '0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612',
+  'SOL': '0x24ceA4b8ce57cdA5058b924B9B9987992450590c',
+  'DOGE': '0x9A7FB1b3950837a8D9b40517626E11D4127C098C',
+  'AAPL': '0xc4A750B3E14bEF69Db22F2f5AaEEb77b6d1A4E42',
+  'TSLA': '0x3609baAa0a9b1F0FE4B300b15BCa8bBdB8C22E66',
+  'AMZN': '0xd6a77691f071E98Df7217BED98f38ae6d2313EBA',
+  'GOOGL': '0x1D1a83331e9D255EB1Aaf75026B60dFD00A252ba',
+  'META': '0xcd1BD86FDc33080DCF1b5715B6FCe04eC6F85845',
+  'NVDA': '0x4881A4418b5F2460B21d6F08CD5aA0678a7f262F',
+  'SPY': '0x46306F3795342117721D8DEd50fbcE4eFbee0aBe',
+  'XAU': '0x1F954Dc24a49708C26E0C1777f16750B5C6d5a2c'
+};
+
+/* Cached mapping from pairIndex -> asset ticker, populated by loadOpenTrades */
+var pairIndexToTicker = {};
+
+/* Cache of open trade metadata keyed by tradeIndex, used to record history on close */
+var _openTradesCache = {};
+var TRADE_HISTORY_KEY = 'tidechart_trade_history';
+
+function getTradeHistory() {
+  try {
+    var raw = localStorage.getItem(TRADE_HISTORY_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch (_) { return []; }
+}
+
+function saveTradeToHistory(entry) {
+  var history = getTradeHistory();
+  history.unshift(entry);
+  if (history.length > 50) history = history.slice(0, 50);
+  try { localStorage.setItem(TRADE_HISTORY_KEY, JSON.stringify(history)); } catch (_) {}
+}
+
+function resolveFeedForPairIndex(pairIndex, pairNames) {
+  if (pairIndexToTicker[pairIndex]) return CHAINLINK_FEEDS[pairIndexToTicker[pairIndex]] || null;
+  var name = pairNames[pairIndex];
+  if (!name) return null;
+  var ticker = name.split('/')[0];
+  if (ticker) pairIndexToTicker[pairIndex] = ticker;
+  return CHAINLINK_FEEDS[ticker] || null;
+}
+
+async function fetchChainlinkPrice(feedAddr, provider) {
+  if (!feedAddr || !provider) return null;
+  try {
+    var feedAbi = ['function latestRoundData() view returns (uint80,int256,uint256,uint256,uint80)'];
+    var feed = new ethers.Contract(feedAddr, feedAbi, provider);
+    var roundData = await feed.latestRoundData();
+    return Number(roundData[1]) / 1e8;
+  } catch (_) { return null; }
+}
+
 var walletState = {
   connected: false,
   address: null,
@@ -234,6 +290,7 @@ async function connectWallet() {
 
     await refreshUSDCBalance();
     loadOpenTrades();
+    loadTradeHistory();
     showToast('Connected: ' + shortAddr(address), 'success');
     validateTradeClient();
   } catch (e) {
@@ -373,28 +430,11 @@ async function executeTrade() {
   var slPct = parseFloat(document.getElementById('trade-sl').value) || 0;
 
   // Fetch live price from Chainlink on-chain feed (same oracle gTrade uses)
-  var chainlinkFeeds = {
-    'BTC': '0x6ce185860a4963106506C203335A2910413708e9',
-    'ETH': '0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612',
-    'SOL': '0x24ceA4b8ce57cdA5058b924B9B9987992450590c',
-    'DOGE': '0x9A7FB1b3950837a8D9b40517626E11D4127C098C',
-    'AAPL': '0xc4A750B3E14bEF69Db22F2f5AaEEb77b6d1A4E42',
-    'TSLA': '0x3609baAa0a9b1F0FE4B300b15BCa8bBdB8C22E66',
-    'AMZN': '0xd6a77691f071E98Df7217BED98f38ae6d2313EBA',
-    'GOOGL': '0x1D1a83331e9D255EB1Aaf75026B60dFD00A252ba',
-    'META': '0xcd1BD86FDc33080DCF1b5715B6FCe04eC6F85845',
-    'NVDA': '0x4881A4418b5F2460B21d6F08CD5aA0678a7f262F'
-  };
   var currentPrice = 0;
-  var feedAddr = chainlinkFeeds[asset];
+  var feedAddr = CHAINLINK_FEEDS[asset];
   if (feedAddr && walletState.provider) {
-    try {
-      var feedAbi = ['function latestRoundData() view returns (uint80,int256,uint256,uint256,uint80)'];
-      var feed = new ethers.Contract(feedAddr, feedAbi, walletState.provider);
-      var roundData = await feed.latestRoundData();
-      currentPrice = Number(roundData[1]) / 1e8; // Chainlink uses 8 decimals
-    } catch (e) {
-    }
+    var clPrice = await fetchChainlinkPrice(feedAddr, walletState.provider);
+    if (clPrice) currentPrice = clPrice;
   }
   if (!currentPrice) {
     currentPrice = (typeof currentAssets !== 'undefined' && currentAssets[asset])
@@ -562,9 +602,11 @@ function selectTradeAsset(asset) {
 function pollOpenTrades(attempts, intervalMs) {
   var count = 0;
   loadOpenTrades();
+  loadTradeHistory();
   var timer = setInterval(function() {
     count++;
     loadOpenTrades();
+    loadTradeHistory();
     refreshUSDCBalance();
     if (count >= attempts) clearInterval(timer);
   }, intervalMs);
@@ -583,6 +625,44 @@ async function loadOpenTrades() {
       container.innerHTML = '<div class="no-trades">No open positions</div>';
       return;
     }
+
+    // Populate pairIndexToTicker cache from pair_names
+    Object.keys(pairNames).forEach(function(idx) {
+      var ticker = pairNames[idx].split('/')[0];
+      if (ticker) pairIndexToTicker[idx] = ticker;
+    });
+
+    // Fetch live Chainlink prices for each unique pair index
+    var uniquePairs = {};
+    trades.forEach(function(item) {
+      var t = item.trade || item;
+      var pairIdx = parseInt(t.pairIndex || '0');
+      if (!uniquePairs[pairIdx]) uniquePairs[pairIdx] = true;
+    });
+    var livePrices = {};
+    if (walletState.provider) {
+      var pricePromises = Object.keys(uniquePairs).map(async function(pairIdx) {
+        var feedAddr = resolveFeedForPairIndex(parseInt(pairIdx), pairNames);
+        if (feedAddr) {
+          var price = await fetchChainlinkPrice(feedAddr, walletState.provider);
+          if (price) livePrices[pairIdx] = price;
+        }
+      });
+      await Promise.all(pricePromises);
+    }
+    // Fallback: fill missing prices from Synth API currentAssets cache
+    if (typeof currentAssets !== 'undefined') {
+      Object.keys(uniquePairs).forEach(function(pairIdx) {
+        if (!livePrices[pairIdx]) {
+          var ticker = pairIndexToTicker[pairIdx];
+          if (ticker && currentAssets[ticker] && currentAssets[ticker].current_price) {
+            livePrices[pairIdx] = currentAssets[ticker].current_price;
+          }
+        }
+      });
+    }
+
+    _openTradesCache = {};
     var html = '';
     trades.forEach(function(item) {
       var t = item.trade || item;
@@ -592,23 +672,86 @@ async function loadOpenTrades() {
       var dirClass = t.long ? 'positive' : 'negative';
       var pairLabel = pairNames[pairIdx] || ('Pair #' + pairIdx);
       var lev = t.leverage ? (parseFloat(t.leverage) / 1000).toFixed(0) + 'x' : '?x';
+      var levNum = t.leverage ? parseFloat(t.leverage) / 1000 : 0;
+      // Cache for trade history recording
+      _openTradesCache[tradeIdx] = { pairIdx: pairIdx, pairLabel: pairLabel, dir: dir, lev: lev, long: t.long,
+        leverage: t.leverage, collateralAmount: t.collateralAmount, collateralIndex: t.collateralIndex, openPrice: t.openPrice };
       var colRaw = BigInt(t.collateralAmount || '0');
       var colIdx = parseInt(t.collateralIndex || '3');
       var colDecimals = (colIdx === 3) ? 6 : 18;
-      var col = (Number(colRaw) / Math.pow(10, colDecimals)).toFixed(2);
-      var openPrice = t.openPrice ? (parseFloat(t.openPrice) / 1e10).toFixed(2) : '?';
+      var col = Number(colRaw) / Math.pow(10, colDecimals);
+      var colFmt = col.toFixed(2);
+      var entryPrice = t.openPrice ? parseFloat(t.openPrice) / 1e10 : 0;
+      var entryFmt = entryPrice > 0 ? '$' + entryPrice.toFixed(2) : '?';
+
+      // Calculate unrealized P&L
+      var pnlHtml = '';
+      var curPrice = livePrices[pairIdx];
+      if (curPrice && entryPrice > 0 && levNum > 0) {
+        var pnlPct = t.long
+          ? ((curPrice - entryPrice) / entryPrice) * levNum * 100
+          : ((entryPrice - curPrice) / entryPrice) * levNum * 100;
+        var pnlUsd = col * (pnlPct / 100);
+        var pnlClass = pnlUsd >= 0 ? 'positive' : 'negative';
+        var pnlSign = pnlUsd >= 0 ? '+' : '';
+        pnlHtml = '<span class="trade-pnl ' + pnlClass + '">' +
+          pnlSign + pnlUsd.toFixed(2) + ' USDC (' + pnlSign + pnlPct.toFixed(2) + '%)' +
+          '</span>';
+      }
+
       html += '<div class="open-trade-row">' +
+        '<div class="trade-row-info">' +
+        '<div class="trade-row-main">' +
         '<span class="' + dirClass + '">' + dir + ' ' + lev + '</span>' +
         '<span>' + pairLabel + '</span>' +
-        '<span>Entry: $' + openPrice + '</span>' +
-        '<span>' + col + ' USDC</span>' +
-        '<button class="close-trade-btn" onclick="closeTrade(' + tradeIdx + ',' + pairIdx + ')" title="Close position">✕</button>' +
+        '<span>Entry: ' + entryFmt + (curPrice ? ' / Now: $' + curPrice.toFixed(2) : '') + '</span>' +
+        '<span>' + colFmt + ' USDC</span>' +
+        '</div>' +
+        (pnlHtml ? '<div class="trade-row-pnl">' + pnlHtml + '</div>' : '') +
+        '</div>' +
+        '<button class="close-trade-btn" onclick="closeTrade(' + tradeIdx + ',' + pairIdx + ')" title="Close position">&#x2715;</button>' +
         '</div>';
     });
     container.innerHTML = html;
   } catch (e) {
     container.innerHTML = '<div class="no-trades">Could not load trades</div>';
   }
+}
+
+function loadTradeHistory() {
+  var container = document.getElementById('trade-history-list');
+  if (!container) return;
+  var history = getTradeHistory();
+  if (history.length === 0) {
+    container.innerHTML = '<div class="no-trades">No trade history</div>';
+    return;
+  }
+  var html = '';
+  history.forEach(function(h) {
+    var dirClass = h.long ? 'positive' : 'negative';
+    var pnlVal = parseFloat(h.pnlUsd || '0');
+    var pnlPctVal = parseFloat(h.pnlPct || '0');
+    var pnlClass = pnlVal >= 0 ? 'positive' : 'negative';
+    var pnlSign = pnlVal >= 0 ? '+' : '';
+    var pnlHtml = '<span class="trade-pnl ' + pnlClass + '">' +
+      pnlSign + pnlVal.toFixed(2) + ' USDC (' + pnlSign + pnlPctVal.toFixed(1) + '%)</span>';
+    var txLink = h.txHash
+      ? ' <a href="https://arbiscan.io/tx/' + h.txHash + '" target="_blank" rel="noopener" style="color:var(--accent);font-size:10px">tx</a>'
+      : '';
+    html += '<div class="open-trade-row history-row">' +
+      '<div class="trade-row-info">' +
+      '<div class="trade-row-main">' +
+      '<span class="' + dirClass + '">' + (h.dir || '?') + ' ' + (h.lev || '?x') + '</span>' +
+      '<span>' + (h.pairLabel || '?') + '</span>' +
+      '<span>Entry: $' + (h.entryPrice || '?') + ' / Close: $' + (h.closePrice || '?') + '</span>' +
+      '<span>' + (h.collateral || '?') + ' USDC</span>' +
+      '</div>' +
+      '<div class="trade-row-pnl">' + pnlHtml + txLink + '</div>' +
+      '</div>' +
+      '<span class="history-badge">CLOSED</span>' +
+      '</div>';
+  });
+  container.innerHTML = html;
 }
 
 async function closeTrade(tradeIndex, pairIndex) {
@@ -626,21 +769,35 @@ async function closeTrade(tradeIndex, pairIndex) {
   }
   tradePending = true;
   try {
-    // Fetch live Chainlink price for the pair (same as openTrade)
-    var chainlinkByPair = {
-      0: '0x6ce185860a4963106506C203335A2910413708e9',   // BTC
-      1: '0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612',   // ETH
-    };
-    var expectedPrice = BigInt(0);
-    var feedAddr = chainlinkByPair[pairIndex];
-    if (feedAddr && walletState.provider) {
+    // Resolve Chainlink feed dynamically from cached pair names
+    var feedAddr = resolveFeedForPairIndex(pairIndex, pairIndexToTicker);
+    if (!feedAddr) {
+      // Fallback: fetch pair names from server to populate the cache
       try {
-        var feedAbi = ['function latestRoundData() view returns (uint80,int256,uint256,uint256,uint80)'];
-        var feed = new ethers.Contract(feedAddr, feedAbi, walletState.provider);
-        var roundData = await feed.latestRoundData();
-        // Chainlink 8 decimals → gTrade 10 decimals: multiply by 100
-        expectedPrice = BigInt(roundData[1]) * 100n;
+        var prResp = await fetch('/api/gtrade/open-trades?address=' + walletState.address);
+        var prData = await prResp.json();
+        var pairNames = prData.pair_names || {};
+        feedAddr = resolveFeedForPairIndex(pairIndex, pairNames);
       } catch (_) {}
+    }
+    var expectedPrice = BigInt(0);
+    if (feedAddr && walletState.provider) {
+      var livePrice = await fetchChainlinkPrice(feedAddr, walletState.provider);
+      if (livePrice) {
+        expectedPrice = BigInt(Math.round(livePrice * 1e10));
+      }
+    }
+    // Fallback: use Synth API price from currentAssets cache (stocks, commodities, etc.)
+    if (expectedPrice === BigInt(0)) {
+      var ticker = pairIndexToTicker[pairIndex];
+      if (ticker && typeof currentAssets !== 'undefined' && currentAssets[ticker] && currentAssets[ticker].current_price) {
+        expectedPrice = BigInt(Math.round(currentAssets[ticker].current_price * 1e10));
+      }
+    }
+    if (expectedPrice === BigInt(0)) {
+      showToast('Could not fetch live price for this pair. Try again.', 'error');
+      tradePending = false;
+      return;
     }
 
     var closeAbi = ['function closeTradeMarket(uint32 _index, uint64 _expectedPrice)'];
@@ -653,6 +810,33 @@ async function closeTrade(tradeIndex, pairIndex) {
       'Position closed! <a href="https://arbiscan.io/tx/' + receipt.hash + '" target="_blank" rel="noopener">View on Arbiscan</a>',
       'success', 10000
     );
+    // Record closed trade to localStorage history
+    var cached = _openTradesCache[tradeIndex] || {};
+    var closePriceFloat = Number(expectedPrice) / 1e10;
+    var entryP = cached.openPrice ? parseFloat(cached.openPrice) / 1e10 : 0;
+    var levNum = cached.leverage ? parseFloat(cached.leverage) / 1000 : 0;
+    var colIdx = parseInt(cached.collateralIndex || '3');
+    var colDec = (colIdx === 3) ? 6 : 18;
+    var colNum = cached.collateralAmount ? Number(BigInt(cached.collateralAmount)) / Math.pow(10, colDec) : 0;
+    var pnlPct = 0;
+    if (entryP > 0 && levNum > 0) {
+      pnlPct = cached.long
+        ? ((closePriceFloat - entryP) / entryP) * levNum * 100
+        : ((entryP - closePriceFloat) / entryP) * levNum * 100;
+    }
+    saveTradeToHistory({
+      pairLabel: cached.pairLabel || ('Pair #' + pairIndex),
+      dir: cached.dir || '?',
+      lev: cached.lev || '?x',
+      long: !!cached.long,
+      collateral: colNum.toFixed(2),
+      entryPrice: entryP.toFixed(2),
+      closePrice: closePriceFloat.toFixed(2),
+      pnlUsd: (colNum * (pnlPct / 100)).toFixed(2),
+      pnlPct: pnlPct.toFixed(1),
+      txHash: receipt.hash,
+      closedAt: new Date().toISOString()
+    });
     await refreshUSDCBalance();
     // Poll for backend to index the closed trade
     pollOpenTrades(5, 3000);
@@ -680,6 +864,7 @@ if (typeof window !== 'undefined' && window.ethereum) {
       updateWalletUI();
       refreshUSDCBalance();
       loadOpenTrades();
+      loadTradeHistory();
       validateTradeClient();
     }
   });
@@ -688,6 +873,7 @@ if (typeof window !== 'undefined' && window.ethereum) {
     updateWalletUI();
     refreshUSDCBalance();
     loadOpenTrades();
+    loadTradeHistory();
     validateTradeClient();
   });
 }

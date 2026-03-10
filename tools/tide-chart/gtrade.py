@@ -219,6 +219,25 @@ def fetch_open_trades(address: str) -> list[dict]:
         return []
 
 
+def fetch_trade_history(address: str) -> list[dict]:
+    """Fetch historical trades (open & closed) for a wallet address.
+
+    Returns a list of trade history dicts, or empty list on failure.
+    """
+    if not address:
+        return []
+    try:
+        resp = requests.get(
+            f"{GTRADE_BACKEND_URL}/personal-trading-history-table/{address.lower()}",
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, list) else []
+    except (requests.RequestException, ValueError):
+        return []
+
+
 def resolve_pair_index(asset: str, trading_vars: Optional[dict] = None, skip_fetch: bool = False) -> Optional[int]:
     """Resolve a Tide Chart ticker to its gTrade pair index.
 

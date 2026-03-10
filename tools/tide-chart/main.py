@@ -35,6 +35,7 @@ from gtrade import (
     resolve_pair_index,
     get_cached_trading_variables,
     fetch_open_trades,
+    fetch_trade_history,
     get_pair_name_map,
 )
 
@@ -476,11 +477,20 @@ def generate_dashboard_html(client) -> str:
         "  .open-trades-section { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border); }\n"
         "  .open-trades-header { font-family: 'IBM Plex Mono', monospace; font-size: 10px;\n"
         "    text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); margin-bottom: 8px; }\n"
-        "  .open-trade-row { display: flex; justify-content: space-between; padding: 6px 0;\n"
+        "  .open-trade-row { display: flex; align-items: center; gap: 8px; padding: 8px 0;\n"
         "    font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--text-secondary);\n"
         "    border-bottom: 1px solid rgba(30,42,64,0.5); }\n"
         "  .open-trade-row:last-child { border-bottom: none; }\n"
-        "  .open-trade-row { align-items: center; }\n"
+        "  .trade-row-info { flex: 1; min-width: 0; }\n"
+        "  .trade-row-main { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }\n"
+        "  .trade-row-pnl { margin-top: 3px; }\n"
+        "  .trade-pnl { font-weight: 600; font-size: 11px; }\n"
+        "  .trade-pnl.positive { color: var(--positive); }\n"
+        "  .trade-pnl.negative { color: var(--negative); }\n"
+        "  .history-badge { font-size: 9px; font-weight: 600; padding: 2px 6px; border-radius: 3px;\n"
+        "    background: rgba(100,116,139,0.2); color: var(--text-muted); border: 1px solid rgba(100,116,139,0.3);\n"
+        "    white-space: nowrap; flex-shrink: 0; }\n"
+        "  .history-row { opacity: 0.8; }\n"
         "  .close-trade-btn { background: rgba(239,68,68,0.15); color: #ef4444; border: 1px solid rgba(239,68,68,0.3);\n"
         "    border-radius: 4px; padding: 2px 6px; font-size: 10px; cursor: pointer;\n"
         "    font-family: 'IBM Plex Mono', monospace; transition: all 0.2s; }\n"
@@ -614,6 +624,10 @@ def generate_dashboard_html(client) -> str:
         '    <div class="open-trades-section">\n'
         '      <div class="open-trades-header">Open Positions</div>\n'
         '      <div id="open-trades-list"><div class="no-trades">Connect wallet to view positions</div></div>\n'
+        '    </div>\n'
+        '    <div class="open-trades-section">\n'
+        '      <div class="open-trades-header">Trade History</div>\n'
+        '      <div id="trade-history-list"><div class="no-trades">Connect wallet to view history</div></div>\n'
         '    </div>\n'
         '  </div>\n'
         "\n"
@@ -976,6 +990,15 @@ def create_app(client=None) -> Flask:
         trades = fetch_open_trades(address)
         pair_names = get_pair_name_map()
         return jsonify({"address": address, "trades": trades, "pair_names": pair_names})
+
+    @app.route("/api/gtrade/trade-history")
+    def gtrade_trade_history():
+        address = request.args.get("address", "").strip()
+        if not address or len(address) != 42 or not address.startswith("0x"):
+            return jsonify({"error": "Invalid Ethereum address", "history": []}), 400
+        history = fetch_trade_history(address)
+        pair_names = get_pair_name_map()
+        return jsonify({"address": address, "history": history, "pair_names": pair_names})
 
     return app
 
