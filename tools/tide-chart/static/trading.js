@@ -40,6 +40,246 @@ function saveTradeToHistory(entry) {
   try { localStorage.setItem(TRADE_HISTORY_KEY, JSON.stringify(history)); } catch (_) {}
 }
 
+/* ========== Liquidation Price (client-side) ========== */
+function calculateLiquidationPrice(entryPrice, isLong, leverage) {
+  if (leverage <= 0 || entryPrice <= 0) return 0;
+  var threshold = 0.9; // 90% loss triggers liquidation
+  if (isLong) return entryPrice * (1 - threshold / leverage);
+  return entryPrice * (1 + threshold / leverage);
+}
+
+/* ========== Trade Management Panel ========== */
+function toggleManagePanel(tradeIndex) {
+  var panel = document.getElementById('manage-panel-' + tradeIndex);
+  if (!panel) return;
+  panel.classList.toggle('open');
+}
+
+async function updateTradeTP(tradeIndex, remove) {
+  if (!walletState.connected || !walletState.signer || tradePending) return;
+  if (walletState.chainId !== 42161) { showToast('Switch to Arbitrum', 'error'); return; }
+  var cached = _openTradesCache[tradeIndex];
+  // Warn if stock pair and market is closed (oracle callbacks may fail)
+  if (cached) {
+    var ticker = pairIndexToTicker[cached.pairIdx] || pairIndexToTicker[String(cached.pairIdx)];
+    if (ticker && gtradeConfig && gtradeConfig.pairs && gtradeConfig.pairs[ticker] && gtradeConfig.pairs[ticker].group === 'stocks') {
+      var mkt = await checkMarketStatus();
+      if (!mkt.open) { showToast(mkt.reason + '. TP/SL updates on stocks may fail.', 'error', 6000); }
+    }
+  }
+  var newTp;
+  if (remove) {
+    newTp = BigInt(0);
+  } else {
+    var input = document.getElementById('manage-tp-' + tradeIndex);
+    var tpPrice = parseFloat(input ? input.value : '');
+    if (isNaN(tpPrice) || tpPrice <= 0) { showToast('Enter a valid TP price', 'error'); return; }
+    // Skip if value hasn't changed
+    if (cached) {
+      var currentTp = cached.tp ? parseFloat(cached.tp) / 1e10 : 0;
+      if (Math.abs(tpPrice - currentTp) < 0.005) { showToast('TP is already set to $' + currentTp.toFixed(2), 'info'); return; }
+    }
+    // Validate TP direction and max distance
+    if (cached) {
+      var entryPrice = cached.openPrice ? parseFloat(cached.openPrice) / 1e10 : 0;
+      if (entryPrice > 0) {
+        if (cached.long && tpPrice <= entryPrice) { showToast('TP must be above entry price ($' + entryPrice.toFixed(2) + ') for longs', 'error'); return; }
+        if (!cached.long && tpPrice >= entryPrice) { showToast('TP must be below entry price ($' + entryPrice.toFixed(2) + ') for shorts', 'error'); return; }
+        var tpPct = Math.abs(tpPrice - entryPrice) / entryPrice * 100;
+        if (tpPct > 900) { showToast('TP cannot exceed 900% from entry price', 'error'); return; }
+      }
+    }
+    newTp = BigInt(Math.round(tpPrice * 1e10));
+  }
+  tradePending = true;
+  try {
+    var abi = ['function updateTp(uint32 _index, uint64 _newTp)'];
+    var diamond = new ethers.Contract(gtradeConfig.trading_contract, abi, walletState.signer);
+    showToast(remove ? 'Removing TP...' : 'Updating TP...', 'info', 15000);
+    var tx = await diamond.updateTp(tradeIndex, newTp, { gasLimit: 1500000 });
+    await tx.wait();
+    showToast(remove ? 'TP removed' : 'TP updated to $' + (Number(newTp) / 1e10).toFixed(2), 'success');
+    // Optimistic UI + cache update: patch displayed TP and cache immediately (backend API has indexing delay)
+    var tpDisplay = Number(newTp) / 1e10;
+    var tpSpan = document.querySelector('[data-tp-trade="' + tradeIndex + '"]');
+    if (tpSpan) tpSpan.textContent = remove ? '' : 'TP: $' + tpDisplay.toFixed(2);
+    var tpInput = document.getElementById('manage-tp-' + tradeIndex);
+    if (tpInput) tpInput.value = remove ? '' : tpDisplay.toFixed(2);
+    if (_openTradesCache[tradeIndex]) _openTradesCache[tradeIndex].tp = String(newTp);
+    pollOpenTrades(5, 6000);
+  } catch (e) {
+    var msg = e.reason || e.shortMessage || e.message || 'Update TP failed';
+    if (e.code === 4001 || (e.info && e.info.error && e.info.error.code === 4001)) msg = 'Transaction rejected';
+    showToast(msg.length > 120 ? msg.slice(0, 120) + '...' : msg, 'error');
+  } finally { tradePending = false; }
+}
+
+async function updateTradeSL(tradeIndex, remove) {
+  if (!walletState.connected || !walletState.signer || tradePending) return;
+  if (walletState.chainId !== 42161) { showToast('Switch to Arbitrum', 'error'); return; }
+  var cached = _openTradesCache[tradeIndex];
+  // Warn if stock pair and market is closed
+  if (cached) {
+    var ticker = pairIndexToTicker[cached.pairIdx] || pairIndexToTicker[String(cached.pairIdx)];
+    if (ticker && gtradeConfig && gtradeConfig.pairs && gtradeConfig.pairs[ticker] && gtradeConfig.pairs[ticker].group === 'stocks') {
+      var mkt = await checkMarketStatus();
+      if (!mkt.open) { showToast(mkt.reason + '. TP/SL updates on stocks may fail.', 'error', 6000); }
+    }
+  }
+  var newSl;
+  if (remove) {
+    newSl = BigInt(0);
+  } else {
+    var input = document.getElementById('manage-sl-' + tradeIndex);
+    var slPrice = parseFloat(input ? input.value : '');
+    if (isNaN(slPrice) || slPrice <= 0) { showToast('Enter a valid SL price', 'error'); return; }
+    // Skip if value hasn't changed
+    if (cached) {
+      var currentSl = cached.sl ? parseFloat(cached.sl) / 1e10 : 0;
+      if (Math.abs(slPrice - currentSl) < 0.005) { showToast('SL is already set to $' + currentSl.toFixed(2), 'info'); return; }
+    }
+    // Validate SL direction and max distance (MAX_SL_P = 75, so max SL % = 75 / leverage)
+    if (cached) {
+      var entryPrice = cached.openPrice ? parseFloat(cached.openPrice) / 1e10 : 0;
+      var levNum = cached.leverage ? parseFloat(cached.leverage) / 1000 : 0;
+      if (entryPrice > 0) {
+        if (cached.long && slPrice >= entryPrice) { showToast('SL must be below entry price ($' + entryPrice.toFixed(2) + ') for longs', 'error'); return; }
+        if (!cached.long && slPrice <= entryPrice) { showToast('SL must be above entry price ($' + entryPrice.toFixed(2) + ') for shorts', 'error'); return; }
+        if (levNum > 0) {
+          var maxSlPct = 75 / levNum;
+          var slPct = Math.abs(slPrice - entryPrice) / entryPrice * 100;
+          if (slPct > maxSlPct) { showToast('SL too far from entry. Max distance at ' + levNum.toFixed(0) + 'x leverage: ' + maxSlPct.toFixed(2) + '%', 'error', 6000); return; }
+        }
+      }
+    }
+    newSl = BigInt(Math.round(slPrice * 1e10));
+  }
+  tradePending = true;
+  try {
+    var abi = ['function updateSl(uint32 _index, uint64 _newSl)'];
+    var diamond = new ethers.Contract(gtradeConfig.trading_contract, abi, walletState.signer);
+    showToast(remove ? 'Removing SL...' : 'Updating SL...', 'info', 15000);
+    var tx = await diamond.updateSl(tradeIndex, newSl, { gasLimit: 1500000 });
+    await tx.wait();
+    showToast(remove ? 'SL removed' : 'SL updated to $' + (Number(newSl) / 1e10).toFixed(2), 'success');
+    // Optimistic UI + cache update: patch displayed SL and cache immediately (backend API has indexing delay)
+    var slDisplay = Number(newSl) / 1e10;
+    var slSpan = document.querySelector('[data-sl-trade="' + tradeIndex + '"]');
+    if (slSpan) slSpan.textContent = remove ? '' : 'SL: $' + slDisplay.toFixed(2);
+    var slInput = document.getElementById('manage-sl-' + tradeIndex);
+    if (slInput) slInput.value = remove ? '' : slDisplay.toFixed(2);
+    if (_openTradesCache[tradeIndex]) _openTradesCache[tradeIndex].sl = String(newSl);
+    pollOpenTrades(5, 6000);
+  } catch (e) {
+    var msg = e.reason || e.shortMessage || e.message || 'Update SL failed';
+    if (e.code === 4001 || (e.info && e.info.error && e.info.error.code === 4001)) msg = 'Transaction rejected';
+    showToast(msg.length > 120 ? msg.slice(0, 120) + '...' : msg, 'error');
+  } finally { tradePending = false; }
+}
+
+async function decreasePosition(tradeIndex) {
+  if (!walletState.connected || !walletState.signer || tradePending) return;
+  if (walletState.chainId !== 42161) { showToast('Switch to Arbitrum', 'error'); return; }
+  var input = document.getElementById('manage-decrease-' + tradeIndex);
+  var amount = parseFloat(input ? input.value : '');
+  if (isNaN(amount) || amount <= 0) { showToast('Enter a valid USDC amount', 'error'); return; }
+
+  // Validate remaining position stays above protocol minimum ($1,500)
+  var cached = _openTradesCache[tradeIndex];
+  // Warn if stock pair and market is closed (oracle callback required for partial close)
+  if (cached) {
+    var _ticker = pairIndexToTicker[cached.pairIdx] || pairIndexToTicker[String(cached.pairIdx)];
+    if (_ticker && gtradeConfig && gtradeConfig.pairs && gtradeConfig.pairs[_ticker] && gtradeConfig.pairs[_ticker].group === 'stocks') {
+      var mkt = await checkMarketStatus();
+      if (!mkt.open) { showToast(mkt.reason + '. Partial closes on stocks may fail.', 'error', 6000); return; }
+    }
+  }
+  if (cached) {
+    var colIdx = parseInt(cached.collateralIndex || '3');
+    var colDecimals = (colIdx === 3) ? 6 : 18;
+    var currentCol = Number(BigInt(cached.collateralAmount || '0')) / Math.pow(10, colDecimals);
+    var levNum = cached.leverage ? parseFloat(cached.leverage) / 1000 : 0;
+    var remainingCol = currentCol - amount;
+    if (remainingCol < 0) { showToast('Amount exceeds position collateral (' + currentCol.toFixed(2) + ' USDC)', 'error'); return; }
+    var remainingPosition = remainingCol * levNum;
+    var minPosition = (gtradeConfig && gtradeConfig.group_limits) ? 1500 : 1500;
+    if (remainingPosition < minPosition && remainingCol > 0) {
+      showToast('Remaining position $' + remainingPosition.toFixed(0) + ' would be below $' + minPosition + ' minimum. Max decrease: ' +
+        Math.max(0, currentCol - (minPosition / levNum)).toFixed(2) + ' USDC', 'error', 8000);
+      return;
+    }
+  }
+
+  var collateralDelta = ethers.parseUnits(amount.toString(), gtradeConfig.usdc_decimals);
+
+  // Fetch current price for _expectedPrice (required by gTrade v9)
+  var expectedPrice = BigInt(0);
+  var ticker = null;
+  if (cached) {
+    ticker = pairIndexToTicker[cached.pairIdx] || pairIndexToTicker[String(cached.pairIdx)];
+    var feedAddr = ticker ? CHAINLINK_FEEDS[ticker] : null;
+    if (feedAddr && walletState.provider) {
+      var livePrice = await fetchChainlinkPrice(feedAddr, walletState.provider);
+      if (livePrice) expectedPrice = BigInt(Math.round(livePrice * 1e10));
+    }
+  }
+  // Fallback: use Synth API cached price
+  if (expectedPrice === BigInt(0) && ticker && typeof currentAssets !== 'undefined' &&
+      currentAssets[ticker] && currentAssets[ticker].current_price) {
+    expectedPrice = BigInt(Math.round(currentAssets[ticker].current_price * 1e10));
+  }
+  if (expectedPrice === BigInt(0)) {
+    showToast('Could not fetch current price for partial close', 'error');
+    return;
+  }
+
+  tradePending = true;
+  try {
+    var abi = ['function decreasePositionSize(uint32 _index, uint120 _collateralDelta, uint24 _leverageDelta, uint64 _expectedPrice)'];
+    var diamond = new ethers.Contract(gtradeConfig.trading_contract, abi, walletState.signer);
+    showToast('Decreasing position by ' + amount.toFixed(2) + ' USDC...', 'info', 15000);
+    var tx = await diamond.decreasePositionSize(tradeIndex, collateralDelta, 0, expectedPrice, { gasLimit: 3000000 });
+    showToast('Partial close submitted...', 'info', 20000);
+    await tx.wait();
+    showToast('Position decreased by ' + amount.toFixed(2) + ' USDC', 'success');
+    await refreshUSDCBalance();
+    // Optimistic UI + cache update for collateral
+    if (cached) {
+      var colIdx = parseInt(cached.collateralIndex || '3');
+      var colDecimals = (colIdx === 3) ? 6 : 18;
+      var oldCol = Number(BigInt(cached.collateralAmount || '0')) / Math.pow(10, colDecimals);
+      var newCol = oldCol - amount;
+      var colSpan = document.querySelector('[data-col-trade="' + tradeIndex + '"]');
+      if (colSpan) colSpan.textContent = newCol.toFixed(2) + ' USDC';
+      var newColRaw = BigInt(cached.collateralAmount || '0') - BigInt(collateralDelta);
+      _openTradesCache[tradeIndex].collateralAmount = String(newColRaw);
+    }
+    pollOpenTrades(5, 6000);
+  } catch (e) {
+    var msg = e.reason || e.shortMessage || e.message || 'Decrease position failed';
+    if (e.code === 4001 || (e.info && e.info.error && e.info.error.code === 4001)) msg = 'Transaction rejected';
+    showToast(msg.length > 120 ? msg.slice(0, 120) + '...' : msg, 'error');
+  } finally { tradePending = false; }
+}
+
+/* ========== Market Hours Check ========== */
+var _marketStatusCache = { open: null, reason: '', ts: 0 };
+
+async function checkMarketStatus() {
+  var now = Date.now();
+  if (_marketStatusCache.open !== null && (now - _marketStatusCache.ts) < 60000) {
+    return _marketStatusCache;
+  }
+  try {
+    var resp = await fetch('/api/gtrade/market-status');
+    var data = await resp.json();
+    _marketStatusCache = { open: data.open, reason: data.reason, ts: now };
+    return _marketStatusCache;
+  } catch (_) {
+    return { open: true, reason: '' };
+  }
+}
+
 function resolveFeedForPairIndex(pairIndex, pairNames) {
   if (pairIndexToTicker[pairIndex]) return CHAINLINK_FEEDS[pairIndexToTicker[pairIndex]] || null;
   var name = pairNames[pairIndex];
@@ -398,11 +638,57 @@ function updateTradePreview() {
   var tp = parseFloat(document.getElementById('trade-tp').value);
   var sl = parseFloat(document.getElementById('trade-sl').value);
   var slippage = parseFloat(document.getElementById('trade-slippage').value) || 1;
-  if (tp > 0) html += '<div class="preview-row"><span>Take Profit</span><span class="positive">+' + tp + '%</span></div>';
-  if (sl > 0) html += '<div class="preview-row"><span>Stop Loss</span><span class="negative">-' + sl + '%</span></div>';
+  if (tp > 0) {
+    var tpTarget = direction === 'long' ? price * (1 + tp / 100) : price * (1 - tp / 100);
+    html += '<div class="preview-row"><span>Take Profit</span><span class="positive">$' + fmt(tpTarget) + ' (+' + tp + '%)</span></div>';
+  }
+  if (sl > 0) {
+    var slTarget = direction === 'long' ? price * (1 - sl / 100) : price * (1 + sl / 100);
+    html += '<div class="preview-row"><span>Stop Loss</span><span class="negative">$' + fmt(slTarget) + ' (-' + sl + '%)</span></div>';
+  }
   html += '<div class="preview-row"><span>Max Slippage</span><span>' + slippage.toFixed(1) + '%</span></div>';
+
+  // Liquidation price estimate
+  if (price > 0 && leverage > 0) {
+    var liqLong = calculateLiquidationPrice(price, direction === 'long', leverage);
+    html += '<div class="preview-row"><span>Est. Liq. Price</span><span class="negative">$' + fmt(liqLong) + '</span></div>';
+  }
+
   html += '<div class="preview-row"><span>Protocol</span><span>gTrade &middot; Arbitrum</span></div>';
   preview.innerHTML = html;
+
+  // Fee estimation (async)
+  if (asset && collateral > 0 && leverage > 0) {
+    fetch('/api/gtrade/estimate-fees', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ asset: asset, collateral_usd: collateral, leverage: leverage })
+    }).then(function(r) { return r.json(); }).then(function(fees) {
+      if (fees.error) return;
+      var existing = preview.querySelector('.fee-estimate');
+      if (existing) existing.remove();
+      var feeHtml = '<div class="fee-estimate">' +
+        '<div class="fee-row"><span>Open Fee (' + fees.fee_pct + '%)</span><span>$' + fees.open_fee.toFixed(2) + '</span></div>' +
+        '<div class="fee-row"><span>Close Fee (est.)</span><span>$' + fees.close_fee.toFixed(2) + '</span></div>' +
+        '<div class="fee-row fee-total"><span>Total Fees</span><span>$' + fees.total_fee.toFixed(2) + '</span></div>' +
+        '</div>';
+      preview.innerHTML += feeHtml;
+    }).catch(function() {});
+  }
+
+  // Market hours warning for stocks (async)
+  if (gtradeConfig && gtradeConfig.pairs && gtradeConfig.pairs[asset]) {
+    var pairGroup = gtradeConfig.pairs[asset].group;
+    if (pairGroup === 'stocks') {
+      checkMarketStatus().then(function(status) {
+        var existing = preview.querySelector('.market-warning');
+        if (existing) existing.remove();
+        if (!status.open) {
+          preview.innerHTML += '<div class="market-warning">\u26A0 ' + status.reason +
+            '. Stock trades will revert on-chain.</div>';
+        }
+      });
+    }
+  }
 }
 
 async function executeTrade() {
@@ -429,6 +715,15 @@ async function executeTrade() {
   var tpPct = parseFloat(document.getElementById('trade-tp').value) || 0;
   var slPct = parseFloat(document.getElementById('trade-sl').value) || 0;
 
+  // Block stock trades when market is closed
+  if (gtradeConfig && gtradeConfig.pairs && gtradeConfig.pairs[asset] && gtradeConfig.pairs[asset].group === 'stocks') {
+    var mktStatus = await checkMarketStatus();
+    if (!mktStatus.open) {
+      showToast(mktStatus.reason + '. Stock trades will revert.', 'error', 8000);
+      return;
+    }
+  }
+
   // Fetch live price from Chainlink on-chain feed (same oracle gTrade uses)
   var currentPrice = 0;
   var feedAddr = CHAINLINK_FEEDS[asset];
@@ -448,13 +743,15 @@ async function executeTrade() {
   var openPriceScaled = BigInt(Math.round(currentPrice * 1e10));
 
   // TP/SL as absolute prices in 1e10 precision
+  // Long: TP above entry, SL below. Short: TP below entry, SL above.
   var tpScaled = 0;
   var slScaled = 0;
-  if (tpPct > 0) {
-    tpScaled = BigInt(Math.round(currentPrice * (1 + tpPct / 100) * 1e10));
-  }
-  if (slPct > 0) {
-    slScaled = BigInt(Math.round(currentPrice * (1 - slPct / 100) * 1e10));
+  if (direction === 'long') {
+    if (tpPct > 0) tpScaled = BigInt(Math.round(currentPrice * (1 + tpPct / 100) * 1e10));
+    if (slPct > 0) slScaled = BigInt(Math.round(currentPrice * (1 - slPct / 100) * 1e10));
+  } else {
+    if (tpPct > 0) tpScaled = BigInt(Math.round(currentPrice * (1 - tpPct / 100) * 1e10));
+    if (slPct > 0) slScaled = BigInt(Math.round(currentPrice * (1 + slPct / 100) * 1e10));
   }
 
   // Server-side validation (mirrors client-side guards)
@@ -675,7 +972,8 @@ async function loadOpenTrades() {
       var levNum = t.leverage ? parseFloat(t.leverage) / 1000 : 0;
       // Cache for trade history recording
       _openTradesCache[tradeIdx] = { pairIdx: pairIdx, pairLabel: pairLabel, dir: dir, lev: lev, long: t.long,
-        leverage: t.leverage, collateralAmount: t.collateralAmount, collateralIndex: t.collateralIndex, openPrice: t.openPrice };
+        leverage: t.leverage, collateralAmount: t.collateralAmount, collateralIndex: t.collateralIndex, openPrice: t.openPrice,
+        tp: t.tp || '0', sl: t.sl || '0' };
       var colRaw = BigInt(t.collateralAmount || '0');
       var colIdx = parseInt(t.collateralIndex || '3');
       var colDecimals = (colIdx === 3) ? 6 : 18;
@@ -694,40 +992,207 @@ async function loadOpenTrades() {
         var pnlUsd = col * (pnlPct / 100);
         var pnlClass = pnlUsd >= 0 ? 'positive' : 'negative';
         var pnlSign = pnlUsd >= 0 ? '+' : '';
-        pnlHtml = '<span class="trade-pnl ' + pnlClass + '">' +
+        pnlHtml = '<span class="trade-pnl ' + pnlClass + '" data-pnl-trade="' + tradeIdx + '">' +
           'Est. ' + pnlSign + pnlUsd.toFixed(2) + ' USDC (' + pnlSign + pnlPct.toFixed(2) + '%)' +
           '</span>';
       }
 
-      html += '<div class="open-trade-row">' +
+      // Liquidation price
+      var liqPrice = calculateLiquidationPrice(entryPrice, !!t.long, levNum);
+      var liqHtml = liqPrice > 0 ? '<span class="liq-price">Liq: $' + liqPrice.toFixed(2) + '</span>' : '';
+
+      // Current TP/SL from trade data
+      var tpRaw = t.tp ? parseFloat(t.tp) / 1e10 : 0;
+      var slRaw = t.sl ? parseFloat(t.sl) / 1e10 : 0;
+      var tpSlHtml = '';
+      if (tpRaw > 0) tpSlHtml += '<span data-tp-trade="' + tradeIdx + '" style="color:var(--positive);font-size:10px">TP: $' + tpRaw.toFixed(2) + '</span> ';
+      if (slRaw > 0) tpSlHtml += '<span data-sl-trade="' + tradeIdx + '" style="color:var(--negative);font-size:10px">SL: $' + slRaw.toFixed(2) + '</span>';
+
+      // Manage panel HTML
+      var manageHtml =
+        '<div class="manage-panel" id="manage-panel-' + tradeIdx + '">' +
+        '<div class="manage-row">' +
+        '<label>Take Profit</label>' +
+        '<input type="number" id="manage-tp-' + tradeIdx + '" placeholder="Price ($)" step="0.01"' +
+        (tpRaw > 0 ? ' value="' + tpRaw.toFixed(2) + '"' : '') + '>' +
+        '<button class="manage-action-btn update" onclick="updateTradeTP(' + tradeIdx + ')">Set TP</button>' +
+        (tpRaw > 0 ? '<button class="manage-action-btn remove" onclick="updateTradeTP(' + tradeIdx + ',true)">Remove</button>' : '') +
+        '</div>' +
+        '<div class="manage-row">' +
+        '<label>Stop Loss</label>' +
+        '<input type="number" id="manage-sl-' + tradeIdx + '" placeholder="Price ($)" step="0.01"' +
+        (slRaw > 0 ? ' value="' + slRaw.toFixed(2) + '"' : '') + '>' +
+        '<button class="manage-action-btn update" onclick="updateTradeSL(' + tradeIdx + ')">Set SL</button>' +
+        (slRaw > 0 ? '<button class="manage-action-btn remove" onclick="updateTradeSL(' + tradeIdx + ',true)">Remove</button>' : '') +
+        '</div>' +
+        '<div class="manage-row">' +
+        '<label>Partial Close</label>' +
+        '<input type="number" id="manage-decrease-' + tradeIdx + '" placeholder="USDC" step="0.01">' +
+        '<button class="manage-action-btn decrease" onclick="decreasePosition(' + tradeIdx + ')">Decrease</button>' +
+        '</div>' +
+        '</div>';
+
+      html += '<div class="open-trade-row" style="flex-wrap:wrap">' +
         '<div class="trade-row-info">' +
         '<div class="trade-row-main">' +
         '<span class="' + dirClass + '">' + dir + ' ' + lev + '</span>' +
         '<span>' + pairLabel + '</span>' +
         '<span>Entry: ' + entryFmt + (curPrice ? ' / Now: $' + curPrice.toFixed(2) : '') + '</span>' +
-        '<span>' + colFmt + ' USDC</span>' +
+        '<span data-col-trade="' + tradeIdx + '">' + colFmt + ' USDC</span>' +
+        liqHtml +
         '</div>' +
+        (tpSlHtml ? '<div style="margin-top:2px">' + tpSlHtml + '</div>' : '') +
         (pnlHtml ? '<div class="trade-row-pnl">' + pnlHtml + '</div>' : '') +
         '</div>' +
+        '<div style="display:flex;gap:4px;align-items:center;flex-shrink:0">' +
+        '<button class="manage-btn" onclick="toggleManagePanel(' + tradeIdx + ')" title="Manage TP/SL & partial close">Manage</button>' +
         '<button class="close-trade-btn" onclick="closeTrade(' + tradeIdx + ',' + pairIdx + ')" title="Close position">&#x2715;</button>' +
+        '</div>' +
+        manageHtml +
         '</div>';
     });
+    // Skip full re-render if a manage panel is open (prevents input flicker)
+    var hasOpenPanel = container.querySelector('.manage-panel.open');
+    if (hasOpenPanel) {
+      // Still update P&L and price text in-place without replacing HTML
+      trades.forEach(function(item) {
+        var t = item.trade || item;
+        var tradeIdx = parseInt(t.index || '0');
+        var pairIdx = parseInt(t.pairIndex || '0');
+        var curPrice = livePrices[pairIdx];
+        var pnlEl = container.querySelector('[data-pnl-trade="' + tradeIdx + '"]');
+        if (pnlEl && curPrice) {
+          var entryP = t.openPrice ? parseFloat(t.openPrice) / 1e10 : 0;
+          var levNum = t.leverage ? parseFloat(t.leverage) / 1000 : 0;
+          var colRaw = BigInt(t.collateralAmount || '0');
+          var colIdx2 = parseInt(t.collateralIndex || '3');
+          var colDec = (colIdx2 === 3) ? 6 : 18;
+          var col2 = Number(colRaw) / Math.pow(10, colDec);
+          if (entryP > 0 && levNum > 0) {
+            var pct = t.long ? ((curPrice - entryP) / entryP) * levNum * 100 : ((entryP - curPrice) / entryP) * levNum * 100;
+            var usd = col2 * (pct / 100);
+            var cls = usd >= 0 ? 'positive' : 'negative';
+            var sgn = usd >= 0 ? '+' : '';
+            pnlEl.className = 'trade-pnl ' + cls;
+            pnlEl.textContent = 'Est. ' + sgn + usd.toFixed(2) + ' USDC (' + sgn + pct.toFixed(2) + '%)';
+          }
+        }
+      });
+      return;
+    }
     container.innerHTML = html;
   } catch (e) {
     container.innerHTML = '<div class="no-trades">Could not load trades</div>';
   }
 }
 
-function loadTradeHistory() {
+async function loadTradeHistory() {
   var container = document.getElementById('trade-history-list');
   if (!container) return;
-  var history = getTradeHistory();
-  if (history.length === 0) {
+  if (!walletState.connected) return;
+
+  // Fetch from gTrade backend (includes liquidations, TP/SL hits, all protocol-closed trades)
+  var backendTrades = [];
+  var pairNames = {};
+  try {
+    var resp = await fetch('/api/gtrade/trade-history?address=' + walletState.address);
+    var data = await resp.json();
+    backendTrades = data.history || [];
+    pairNames = data.pair_names || {};
+  } catch (_) {}
+
+  // Build merged history: backend trades + localStorage-only entries
+  var localHistory = getTradeHistory();
+  var localByTx = {};
+  localHistory.forEach(function(h) { if (h.txHash) localByTx[h.txHash.toLowerCase()] = h; });
+
+  var merged = [];
+
+  // Process backend trades (authoritative source for all closed trades including liquidations)
+  backendTrades.forEach(function(item) {
+    var t = item.trade || item;
+    if (t.isOpen) return; // skip still-open trades
+    var pairIdx = parseInt(t.pairIndex || '0');
+    var dir = t.long ? 'LONG' : 'SHORT';
+    var lev = t.leverage ? (parseFloat(t.leverage) / 1000).toFixed(0) + 'x' : '?x';
+    var levNum = t.leverage ? parseFloat(t.leverage) / 1000 : 0;
+    var colRaw = BigInt(t.collateralAmount || '0');
+    var colIdx = parseInt(t.collateralIndex || '3');
+    var colDecimals = (colIdx === 3) ? 6 : 18;
+    var col = Number(colRaw) / Math.pow(10, colDecimals);
+    var entryPrice = t.openPrice ? (parseFloat(t.openPrice) / 1e10) : 0;
+    var pairLabel = pairNames[pairIdx] || ('Pair #' + pairIdx);
+
+    // Extract close data
+    var closeData = item.closeTradeData || item.close_trade_data || {};
+    var closePrice = closeData.closePrice ? parseFloat(closeData.closePrice) / 1e10 : 0;
+    var pnlUsd = null;
+    var pnlPct = null;
+
+    if (closePrice > 0 && entryPrice > 0 && levNum > 0) {
+      var pctRaw = t.long
+        ? ((closePrice - entryPrice) / entryPrice) * levNum * 100
+        : ((entryPrice - closePrice) / entryPrice) * levNum * 100;
+      pnlUsd = col * (pctRaw / 100);
+      pnlPct = pctRaw;
+    }
+
+    // Detect liquidation: close type or -90%+ loss
+    var isLiquidation = false;
+    if (closeData.closeType !== undefined) {
+      // gTrade closeType: 0=market, 1=TP, 2=SL, 3=LIQ
+      isLiquidation = parseInt(closeData.closeType) === 3;
+    } else if (pnlPct !== null && pnlPct <= -89) {
+      isLiquidation = true;
+    }
+
+    merged.push({
+      dir: dir, lev: lev, long: !!t.long,
+      pairLabel: pairLabel,
+      collateral: col.toFixed(2),
+      entryPrice: entryPrice.toFixed(2),
+      closePrice: closePrice > 0 ? closePrice.toFixed(2) : '?',
+      pnlUsd: pnlUsd !== null ? pnlUsd.toFixed(2) : 'pending',
+      pnlPct: pnlPct !== null ? pnlPct.toFixed(1) : 'pending',
+      txHash: null,
+      closedAt: null,
+      isLiquidation: isLiquidation,
+      _source: 'backend'
+    });
+  });
+
+  // Add localStorage-only entries (recent closes that backend hasn't indexed yet)
+  localHistory.forEach(function(h) {
+    // Check if this local entry is already covered by a backend entry
+    // (match by entry price + collateral + direction as a rough dedup)
+    var dominated = merged.some(function(m) {
+      return m.entryPrice === h.entryPrice && m.collateral === h.collateral && m.dir === h.dir;
+    });
+    if (!dominated) {
+      h._source = 'local';
+      merged.push(h);
+    } else if (h.txHash) {
+      // Enrich the backend entry with the local tx hash
+      for (var i = 0; i < merged.length; i++) {
+        if (merged[i].entryPrice === h.entryPrice && merged[i].collateral === h.collateral && merged[i].dir === h.dir) {
+          if (!merged[i].txHash) merged[i].txHash = h.txHash;
+          if (!merged[i].closedAt && h.closedAt) merged[i].closedAt = h.closedAt;
+          break;
+        }
+      }
+    }
+  });
+
+  // Limit to 20 most recent
+  merged = merged.slice(0, 20);
+
+  if (merged.length === 0) {
     container.innerHTML = '<div class="no-trades">No trade history</div>';
     return;
   }
+
   var html = '';
-  history.forEach(function(h) {
+  merged.forEach(function(h) {
     var dirClass = h.long ? 'positive' : 'negative';
     var pnlHtml = '';
     if (h.pnlUsd === 'pending' || h.pnlPct === 'pending') {
@@ -743,6 +1208,8 @@ function loadTradeHistory() {
     var txLink = h.txHash
       ? ' <a href="https://arbiscan.io/tx/' + h.txHash + '" target="_blank" rel="noopener" style="color:var(--accent);font-size:10px">tx</a>'
       : '';
+    var badge = h.isLiquidation ? 'LIQUIDATED' : 'CLOSED';
+    var badgeClass = h.isLiquidation ? 'history-badge liq-badge' : 'history-badge';
     // Format timestamp
     var timeStr = '';
     if (h.closedAt) {
@@ -764,7 +1231,7 @@ function loadTradeHistory() {
       '</div>' +
       '<div class="trade-row-pnl">' + pnlHtml + txLink + '</div>' +
       '</div>' +
-      '<span class="history-badge">CLOSED</span>' +
+      '<span class="' + badgeClass + '">' + badge + '</span>' +
       '</div>';
   });
   container.innerHTML = html;

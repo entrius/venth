@@ -37,6 +37,12 @@ from gtrade import (
     fetch_open_trades,
     fetch_trade_history,
     get_pair_name_map,
+    is_market_open,
+    estimate_trade_fees,
+    calculate_liquidation_price,
+    GTRADE_PAIRS,
+    LIQ_THRESHOLD_PCT,
+    GROUP_FEES,
 )
 
 ASSET_COLORS = {
@@ -490,12 +496,51 @@ def generate_dashboard_html(client) -> str:
         "  .history-badge { font-size: 9px; font-weight: 600; padding: 2px 6px; border-radius: 3px;\n"
         "    background: rgba(100,116,139,0.2); color: var(--text-muted); border: 1px solid rgba(100,116,139,0.3);\n"
         "    white-space: nowrap; flex-shrink: 0; }\n"
+        "  .history-badge.liq-badge { background: rgba(240,96,112,0.15); color: var(--negative);\n"
+        "    border-color: rgba(240,96,112,0.3); }\n"
         "  .history-row { opacity: 0.8; }\n"
         "  .close-trade-btn { background: rgba(239,68,68,0.15); color: #ef4444; border: 1px solid rgba(239,68,68,0.3);\n"
         "    border-radius: 4px; padding: 2px 6px; font-size: 10px; cursor: pointer;\n"
         "    font-family: 'IBM Plex Mono', monospace; transition: all 0.2s; }\n"
         "  .close-trade-btn:hover { background: rgba(239,68,68,0.3); border-color: #ef4444; }\n"
         "  .no-trades { font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--text-muted); }\n"
+        "  .manage-btn { background: rgba(232,212,77,0.12); color: var(--accent); border: 1px solid rgba(232,212,77,0.25);\n"
+        "    border-radius: 4px; padding: 2px 8px; font-family: 'IBM Plex Mono', monospace; font-size: 9px;\n"
+        "    cursor: pointer; transition: all 0.2s; letter-spacing: 0.5px; }\n"
+        "  .manage-btn:hover { background: rgba(232,212,77,0.25); }\n"
+        "  .manage-panel { display: none; width: 100%; padding: 10px 0 6px; margin-top: 6px;\n"
+        "    border-top: 1px dashed rgba(30,42,64,0.8); }\n"
+        "  .manage-panel.open { display: block; }\n"
+        "  .manage-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; }\n"
+        "  .manage-row label { font-family: 'IBM Plex Mono', monospace; font-size: 9px; color: var(--text-muted);\n"
+        "    text-transform: uppercase; letter-spacing: 0.5px; min-width: 70px; }\n"
+        "  .manage-row input { font-family: 'IBM Plex Mono', monospace; font-size: 11px; padding: 4px 8px;\n"
+        "    background: var(--bg-deep); border: 1px solid var(--border); border-radius: 4px;\n"
+        "    color: var(--text-primary); outline: none; width: 100px; }\n"
+        "  .manage-row input:focus { border-color: rgba(232,212,77,0.4); }\n"
+        "  .manage-action-btn { font-family: 'IBM Plex Mono', monospace; font-size: 9px; padding: 4px 10px;\n"
+        "    border-radius: 4px; cursor: pointer; transition: all 0.15s; border: 1px solid; }\n"
+        "  .manage-action-btn.update { background: rgba(52,211,153,0.12); color: var(--positive);\n"
+        "    border-color: rgba(52,211,153,0.25); }\n"
+        "  .manage-action-btn.update:hover { background: rgba(52,211,153,0.25); }\n"
+        "  .manage-action-btn.remove { background: rgba(240,96,112,0.1); color: var(--negative);\n"
+        "    border-color: rgba(240,96,112,0.2); }\n"
+        "  .manage-action-btn.remove:hover { background: rgba(240,96,112,0.25); }\n"
+        "  .manage-action-btn.decrease { background: rgba(232,212,77,0.1); color: var(--accent);\n"
+        "    border-color: rgba(232,212,77,0.25); }\n"
+        "  .manage-action-btn.decrease:hover { background: rgba(232,212,77,0.2); }\n"
+        "  .liq-price { font-size: 10px; color: var(--negative); opacity: 0.8; }\n"
+        "  .fee-estimate { margin-top: 6px; padding: 8px 12px; background: rgba(232,212,77,0.04);\n"
+        "    border: 1px solid rgba(232,212,77,0.1); border-radius: 4px;\n"
+        "    font-family: 'IBM Plex Mono', monospace; font-size: 10px; }\n"
+        "  .fee-estimate .fee-row { display: flex; justify-content: space-between;\n"
+        "    padding: 2px 0; color: var(--text-secondary); }\n"
+        "  .fee-estimate .fee-row span:last-child { color: var(--text-primary); }\n"
+        "  .fee-estimate .fee-total { border-top: 1px solid rgba(232,212,77,0.15);\n"
+        "    margin-top: 2px; padding-top: 4px; color: var(--accent); font-weight: 500; }\n"
+        "  .market-warning { margin-top: 6px; padding: 8px 12px; background: rgba(240,96,112,0.08);\n"
+        "    border: 1px solid rgba(240,96,112,0.2); border-radius: 4px;\n"
+        "    font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: var(--negative); }\n"
         "  .trade-pos-size { font-family: 'IBM Plex Mono', monospace; font-size: 16px;\n"
         "    font-weight: 600; color: var(--text-primary); text-align: center;\n"
         "    padding: 10px; background: var(--bg-deep); border-radius: 6px;\n"
@@ -939,6 +984,22 @@ def create_app(client=None) -> Flask:
     def gtrade_config_route():
         return jsonify(get_contract_config())
 
+    @app.route("/api/gtrade/market-status")
+    def gtrade_market_status():
+        open_now, reason = is_market_open()
+        return jsonify({"open": open_now, "reason": reason})
+
+    @app.route("/api/gtrade/estimate-fees", methods=["POST"])
+    def gtrade_estimate_fees():
+        body = request.get_json(silent=True) or {}
+        asset = body.get("asset", "")
+        collateral_usd = body.get("collateral_usd", 0)
+        leverage = body.get("leverage", 0)
+        if not asset or collateral_usd <= 0 or leverage <= 0:
+            return jsonify({"error": "Missing or invalid parameters"}), 400
+        fees = estimate_trade_fees(asset, collateral_usd, leverage)
+        return jsonify(fees)
+
     @app.route("/api/gtrade/validate-trade", methods=["POST"])
     def gtrade_validate_trade():
         body = request.get_json(silent=True) or {}
@@ -951,6 +1012,13 @@ def create_app(client=None) -> Flask:
         if not valid:
             return jsonify({"valid": False, "error": error}), 400
 
+        # Block stock trades when market is closed
+        pair = GTRADE_PAIRS.get(asset, {})
+        if pair.get("group") == "stocks":
+            mkt_open, mkt_reason = is_market_open()
+            if not mkt_open:
+                return jsonify({"valid": False, "error": mkt_reason}), 400
+
         current_price = 0.0
         try:
             forecast = client.get_prediction_percentiles(asset, horizon="24h")
@@ -958,7 +1026,9 @@ def create_app(client=None) -> Flask:
         except Exception:
             pass
 
+        fees = estimate_trade_fees(asset, collateral_usd, leverage)
         summary = build_trade_summary(asset, current_price, direction, leverage, collateral_usd)
+        summary["fees"] = fees
         return jsonify({"valid": True, "summary": summary})
 
     @app.route("/api/gtrade/resolve-pair")

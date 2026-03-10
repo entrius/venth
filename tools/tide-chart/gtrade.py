@@ -6,6 +6,9 @@ and API proxying for the gTrade decentralized trading protocol on Arbitrum.
 """
 
 import time
+from datetime import datetime, date
+from zoneinfo import ZoneInfo
+
 import requests
 from typing import Optional
 
@@ -46,6 +49,33 @@ GTRADE_PAIRS = {
 TRADEABLE_ASSETS = list(GTRADE_PAIRS.keys())
 
 MIN_COLLATERAL_USD = 5
+
+# Liquidation threshold: gTrade liquidates when collateral loss reaches this %
+LIQ_THRESHOLD_PCT = 90
+
+# Approximate trading fees by group (% of position size)
+GROUP_FEES = {
+    "crypto": {"open_fee_pct": 0.06, "close_fee_pct": 0.06},
+    "stocks": {"open_fee_pct": 0.01, "close_fee_pct": 0.01},
+    "commodities": {"open_fee_pct": 0.01, "close_fee_pct": 0.01},
+}
+
+# US stock market hours (Eastern Time)
+_ET = ZoneInfo("America/New_York")
+_MARKET_OPEN_H, _MARKET_OPEN_M = 9, 30
+_MARKET_CLOSE_H, _MARKET_CLOSE_M = 16, 0
+
+# US market holidays for 2025-2026 (federal holidays when NYSE is closed)
+_MARKET_HOLIDAYS: set[date] = {
+    # 2025
+    date(2025, 1, 1), date(2025, 1, 20), date(2025, 2, 17),
+    date(2025, 4, 18), date(2025, 5, 26), date(2025, 6, 19),
+    date(2025, 7, 4), date(2025, 9, 1), date(2025, 11, 27), date(2025, 12, 25),
+    # 2026
+    date(2026, 1, 1), date(2026, 1, 19), date(2026, 2, 16),
+    date(2026, 4, 3), date(2026, 5, 25), date(2026, 6, 19),
+    date(2026, 7, 3), date(2026, 9, 7), date(2026, 11, 26), date(2026, 12, 25),
+}
 
 _trading_vars_cache: Optional[dict] = None
 _trading_vars_ts: float = 0
@@ -236,6 +266,68 @@ def fetch_trade_history(address: str) -> list[dict]:
         return data if isinstance(data, list) else []
     except (requests.RequestException, ValueError):
         return []
+
+
+def is_market_open() -> tuple[bool, str]:
+    """Check if the US stock market is currently open.
+
+    Returns (is_open, reason). Stocks on gTrade can only be traded
+    during NYSE regular hours: Mon-Fri 9:30 AM - 4:00 PM ET,
+    excluding federal holidays.
+    """
+    now = datetime.now(_ET)
+    if now.date() in _MARKET_HOLIDAYS:
+        return False, "Market closed (holiday)"
+    wd = now.weekday()
+    if wd >= 5:
+        day_name = "Saturday" if wd == 5 else "Sunday"
+        return False, f"Market closed ({day_name})"
+    market_open = now.replace(hour=_MARKET_OPEN_H, minute=_MARKET_OPEN_M, second=0, microsecond=0)
+    market_close = now.replace(hour=_MARKET_CLOSE_H, minute=_MARKET_CLOSE_M, second=0, microsecond=0)
+    if now < market_open:
+        return False, f"Market opens at 9:30 AM ET (currently {now.strftime('%I:%M %p')} ET)"
+    if now >= market_close:
+        return False, "Market closed (after 4:00 PM ET)"
+    return True, "Market open"
+
+
+def estimate_trade_fees(asset: str, collateral_usd: float, leverage: float) -> dict:
+    """Estimate opening and closing fees for a trade.
+
+    Returns a dict with open_fee, close_fee, total_fee (all in USD),
+    and the fee_pct used. Fees are a percentage of position size.
+    """
+    pair = GTRADE_PAIRS.get(asset)
+    if not pair:
+        return {"open_fee": 0, "close_fee": 0, "total_fee": 0, "fee_pct": 0}
+    group = pair["group"]
+    fees = GROUP_FEES.get(group, GROUP_FEES["crypto"])
+    position_usd = collateral_usd * leverage
+    open_fee = position_usd * fees["open_fee_pct"] / 100
+    close_fee = position_usd * fees["close_fee_pct"] / 100
+    return {
+        "open_fee": round(open_fee, 4),
+        "close_fee": round(close_fee, 4),
+        "total_fee": round(open_fee + close_fee, 4),
+        "fee_pct": fees["open_fee_pct"],
+        "position_usd": round(position_usd, 2),
+    }
+
+
+def calculate_liquidation_price(
+    entry_price: float, is_long: bool, leverage: float,
+) -> float:
+    """Calculate the liquidation price for a leveraged position.
+
+    gTrade liquidates when collateral loss reaches ~90%. The remaining
+    ~10% covers the liquidator incentive.
+    """
+    if leverage <= 0 or entry_price <= 0:
+        return 0.0
+    threshold = LIQ_THRESHOLD_PCT / 100
+    if is_long:
+        return entry_price * (1 - threshold / leverage)
+    return entry_price * (1 + threshold / leverage)
 
 
 def resolve_pair_index(asset: str, trading_vars: Optional[dict] = None, skip_fetch: bool = False) -> Optional[int]:

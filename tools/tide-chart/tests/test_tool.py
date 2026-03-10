@@ -44,10 +44,15 @@ from gtrade import (
     get_contract_config,
     get_asset_limits,
     fetch_open_trades,
+    is_market_open,
+    estimate_trade_fees,
+    calculate_liquidation_price,
     TRADEABLE_ASSETS,
     GROUP_LIMITS,
+    GROUP_FEES,
     MIN_COLLATERAL_USD,
     ARBITRUM_CHAIN_ID,
+    LIQ_THRESHOLD_PCT,
 )
 
 
@@ -670,14 +675,14 @@ def test_flask_gtrade_validate_trade_valid():
     app = create_app(client)
     with app.test_client() as tc:
         resp = tc.post("/api/gtrade/validate-trade",
-                       data=json.dumps({"asset": "SPY", "direction": "long",
-                                        "leverage": 10, "collateral_usd": 200}),
+                       data=json.dumps({"asset": "BTC", "direction": "long",
+                                        "leverage": 50, "collateral_usd": 100}),
                        content_type="application/json")
         assert resp.status_code == 200
         data = json.loads(resp.data)
         assert data["valid"] is True
         assert "summary" in data
-        assert data["summary"]["position_size_usd"] == 2000
+        assert data["summary"]["position_size_usd"] == 5000
 
 
 def test_flask_gtrade_validate_trade_invalid():
@@ -771,6 +776,156 @@ def test_fetch_open_trades_empty_address():
     assert result == []
 
 
+# --- Issue #29: Trade Management Enhancement tests ---
+
+
+def test_is_market_open_returns_tuple():
+    """Verify is_market_open returns (bool, str) tuple."""
+    result = is_market_open()
+    assert isinstance(result, tuple)
+    assert len(result) == 2
+    assert isinstance(result[0], bool)
+    assert isinstance(result[1], str)
+    assert len(result[1]) > 0
+
+
+def test_estimate_trade_fees_crypto():
+    """Verify fee estimation for crypto asset."""
+    fees = estimate_trade_fees("BTC", 100, 50)
+    assert fees["open_fee"] > 0
+    assert fees["close_fee"] > 0
+    assert fees["total_fee"] == fees["open_fee"] + fees["close_fee"]
+    assert fees["position_usd"] == 5000.0
+    # Crypto: 0.06% of 5000 = 3.0
+    assert abs(fees["open_fee"] - 3.0) < 0.01
+
+
+def test_estimate_trade_fees_stocks():
+    """Verify fee estimation for stock asset."""
+    fees = estimate_trade_fees("SPY", 200, 10)
+    assert fees["position_usd"] == 2000.0
+    # Stocks: 0.01% of 2000 = 0.2
+    assert abs(fees["open_fee"] - 0.2) < 0.01
+    assert fees["fee_pct"] == 0.01
+
+
+def test_estimate_trade_fees_unknown_asset():
+    """Verify fee estimation returns zeros for unknown asset."""
+    fees = estimate_trade_fees("DOGE", 100, 10)
+    assert fees["open_fee"] == 0
+    assert fees["total_fee"] == 0
+
+
+def test_calculate_liquidation_price_long():
+    """Verify liquidation price for long position."""
+    # Long at $100, 10x: liq = 100 * (1 - 0.9/10) = 100 * 0.91 = $91
+    liq = calculate_liquidation_price(100.0, True, 10)
+    assert abs(liq - 91.0) < 0.01
+
+
+def test_calculate_liquidation_price_short():
+    """Verify liquidation price for short position."""
+    # Short at $100, 10x: liq = 100 * (1 + 0.9/10) = 100 * 1.09 = $109
+    liq = calculate_liquidation_price(100.0, False, 10)
+    assert abs(liq - 109.0) < 0.01
+
+
+def test_calculate_liquidation_price_high_leverage():
+    """Verify liq price moves closer to entry at high leverage."""
+    liq_low = calculate_liquidation_price(100.0, True, 5)
+    liq_high = calculate_liquidation_price(100.0, True, 100)
+    # Higher leverage = liq price closer to entry
+    assert liq_high > liq_low
+
+
+def test_calculate_liquidation_price_edge_cases():
+    """Verify edge cases return 0."""
+    assert calculate_liquidation_price(0, True, 10) == 0.0
+    assert calculate_liquidation_price(100, True, 0) == 0.0
+    assert calculate_liquidation_price(100, True, -5) == 0.0
+
+
+def test_flask_gtrade_market_status():
+    """Verify /api/gtrade/market-status returns open/reason."""
+    client = _make_client()
+    app = create_app(client)
+    with app.test_client() as tc:
+        resp = tc.get("/api/gtrade/market-status")
+        assert resp.status_code == 200
+        data = json.loads(resp.data)
+        assert "open" in data
+        assert "reason" in data
+        assert isinstance(data["open"], bool)
+
+
+def test_flask_gtrade_estimate_fees_valid():
+    """Verify /api/gtrade/estimate-fees returns fee breakdown."""
+    client = _make_client()
+    app = create_app(client)
+    with app.test_client() as tc:
+        resp = tc.post("/api/gtrade/estimate-fees",
+                       data=json.dumps({"asset": "BTC", "collateral_usd": 100, "leverage": 50}),
+                       content_type="application/json")
+        assert resp.status_code == 200
+        data = json.loads(resp.data)
+        assert "open_fee" in data
+        assert "close_fee" in data
+        assert "total_fee" in data
+        assert data["total_fee"] > 0
+
+
+def test_flask_gtrade_estimate_fees_invalid():
+    """Verify /api/gtrade/estimate-fees rejects invalid params."""
+    client = _make_client()
+    app = create_app(client)
+    with app.test_client() as tc:
+        resp = tc.post("/api/gtrade/estimate-fees",
+                       data=json.dumps({"asset": "", "collateral_usd": 0, "leverage": 0}),
+                       content_type="application/json")
+        assert resp.status_code == 400
+
+
+def test_flask_validate_trade_includes_fees():
+    """Verify validate-trade response includes fee data in summary."""
+    client = _make_client()
+    app = create_app(client)
+    with app.test_client() as tc:
+        resp = tc.post("/api/gtrade/validate-trade",
+                       data=json.dumps({"asset": "BTC", "direction": "long",
+                                        "leverage": 50, "collateral_usd": 100}),
+                       content_type="application/json")
+        assert resp.status_code == 200
+        data = json.loads(resp.data)
+        assert data["valid"] is True
+        assert "fees" in data["summary"]
+        assert data["summary"]["fees"]["total_fee"] > 0
+
+
+def test_group_fees_structure():
+    """Verify GROUP_FEES has expected groups and keys."""
+    for group in ["crypto", "stocks", "commodities"]:
+        assert group in GROUP_FEES
+        assert "open_fee_pct" in GROUP_FEES[group]
+        assert "close_fee_pct" in GROUP_FEES[group]
+        assert GROUP_FEES[group]["open_fee_pct"] > 0
+
+
+def test_liq_threshold_constant():
+    """Verify LIQ_THRESHOLD_PCT is 90."""
+    assert LIQ_THRESHOLD_PCT == 90
+
+
+def test_dashboard_html_contains_new_css():
+    """Verify dashboard HTML includes CSS for new trade management features."""
+    client = _make_client()
+    html = generate_dashboard_html(client)
+    assert 'manage-btn' in html
+    assert 'manage-panel' in html
+    assert 'liq-price' in html
+    assert 'fee-estimate' in html
+    assert 'market-warning' in html
+
+
 if __name__ == "__main__":
     test_client_loads_in_mock_mode()
     test_fetch_all_equities_data()
@@ -827,4 +982,19 @@ if __name__ == "__main__":
     test_dashboard_html_contains_wallet_ui()
     test_flask_gtrade_open_trades_invalid_address()
     test_fetch_open_trades_empty_address()
+    test_is_market_open_returns_tuple()
+    test_estimate_trade_fees_crypto()
+    test_estimate_trade_fees_stocks()
+    test_estimate_trade_fees_unknown_asset()
+    test_calculate_liquidation_price_long()
+    test_calculate_liquidation_price_short()
+    test_calculate_liquidation_price_high_leverage()
+    test_calculate_liquidation_price_edge_cases()
+    test_flask_gtrade_market_status()
+    test_flask_gtrade_estimate_fees_valid()
+    test_flask_gtrade_estimate_fees_invalid()
+    test_flask_validate_trade_includes_fees()
+    test_group_fees_structure()
+    test_liq_threshold_constant()
+    test_dashboard_html_contains_new_css()
     print("All tests passed!")
