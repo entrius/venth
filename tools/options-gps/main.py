@@ -20,6 +20,7 @@ from pipeline import (
     select_three_cards,
     should_no_trade,
     forecast_confidence,
+    adjust_confidence_for_divergence,
     is_volatility_elevated,
     estimate_implied_vol,
     compare_volatility,
@@ -31,6 +32,7 @@ from pipeline import (
     PERCENTILE_KEYS,
     PERCENTILE_LABELS,
 )
+from exchanges import get_market_lines, MarketLineResult
 
 SUPPORTED_ASSETS = ["BTC", "ETH", "SOL", "XAU", "SPY", "NVDA", "TSLA", "AAPL", "GOOGL"]
 
@@ -188,7 +190,8 @@ def screen_market_context(symbol: str, current_price: float, confidence: float,
                           fusion_state: str, vol_future: float, vol_realized: float,
                           volatility_high: bool, p1h_last: dict | None, p24h_last: dict | None,
                           no_trade_reason: str | None,
-                          implied_vol: float = 0.0, vol_bias: str | None = None):
+                          implied_vol: float = 0.0, vol_bias: str | None = None,
+                          market_lines: MarketLineResult | None = None):
     """Screen 1b: Market context — shows current conditions before recommendations."""
     print(_header(f"Market Context: {symbol}"))
     print(_kv("Price", f"${current_price:,.2f}"))
@@ -204,6 +207,16 @@ def screen_market_context(symbol: str, current_price: float, confidence: float,
         bias_label = (vol_bias or "").replace("_", " ").upper()
         print(_kv("Implied Vol", f"{implied_vol:.1f}% (from ATM options)"))
         print(_kv("Synth vs IV", f"{iv_ratio:.2f}x \u2192 {bias_label}"))
+    if market_lines and market_lines.summaries:
+        print(f"{BAR}")
+        print(_section("MARKET LINE SHOPPING"))
+        consensus_label = market_lines.consensus.replace('_', ' ').upper()
+        print(f"{BAR}    Consensus : {consensus_label} (avg |\u0394| {market_lines.avg_divergence:.1f}pp)")
+        for s in market_lines.summaries:
+            call_sign = '+' if s.rich_calls >= 0 else ''
+            put_sign = '+' if s.rich_puts >= 0 else ''
+            print(f"{BAR}    {s.exchange:<10s}: avg |\u0394| {s.avg_abs_div:.1f}pp, max {s.max_abs_div:.1f}pp; "
+                  f"calls {call_sign}{s.rich_calls:.1f}pp, puts {put_sign}{s.rich_puts:.1f}pp vs Synth")
     print(f"{BAR}")
     if p1h_last:
         p05 = float(p1h_last.get("0.05", 0))
@@ -622,6 +635,8 @@ def main():
     volatility_high = is_volatility_elevated(vol_future, vol_realized)
     vol_ratio = (vol_future / vol_realized) if vol_realized > 0 else 1.0
     confidence = forecast_confidence(p24h_last, current_price)
+    market_lines = get_market_lines(options, asset=symbol)
+    confidence = adjust_confidence_for_divergence(confidence, market_lines.avg_divergence, market_lines.consensus)
     implied_vol = estimate_implied_vol(options) if view == "vol" else 0.0
     vol_bias = compare_volatility(vol_future, implied_vol) if view == "vol" else None
     no_trade_reason = should_no_trade(fusion_state, view, volatility_high, confidence, vol_bias=vol_bias)
@@ -635,7 +650,8 @@ def main():
         screen_market_context(symbol, current_price, confidence, fusion_state,
                               vol_future, vol_realized, volatility_high,
                               p1h_last, p24h_last, no_trade_reason,
-                              implied_vol=implied_vol, vol_bias=vol_bias)
+                              implied_vol=implied_vol, vol_bias=vol_bias,
+                              market_lines=market_lines)
     if 2 in screens:
         if shown_any:
             _pause("Screen 2: Top Plays", args.no_prompt)
@@ -670,6 +686,17 @@ def main():
         "1h_data_available": p1h_available,
         "no_trade": no_trade_reason is not None,
         "no_trade_reason": no_trade_reason,
+        "market_lines": {
+            "consensus": market_lines.consensus,
+            "avg_divergence": market_lines.avg_divergence,
+            "max_divergence": market_lines.max_divergence,
+            "exchanges": [
+                {"exchange": s.exchange, "avg_abs_div": s.avg_abs_div,
+                 "max_abs_div": s.max_abs_div, "rich_calls": s.rich_calls,
+                 "rich_puts": s.rich_puts}
+                for s in market_lines.summaries
+            ],
+        },
         "candidates_generated": len(candidates),
         "candidates_after_filters": len(scored),
         "best_match": _card_to_log(best),

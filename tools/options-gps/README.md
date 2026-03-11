@@ -28,6 +28,25 @@ Turn a trader's view into one clear options decision. Inputs: **symbol**, **mark
 7. **Guardrails:** Filters no-trade when fusion is countermove/unclear with directional view, volatility exceeds threshold (directional views), confidence is too low, or vol bias is neutral (vol view — no exploitable divergence between Synth and market IV).
 8. **Risk Management:** Each strategy type has a specific risk plan (invalidation trigger, adjustment/reroute rule, review schedule). Short straddle/strangle are labeled "unlimited risk" with hard stops at 2x credit loss; they are risk-gated (high-only for short straddle, medium+ for short strangle).
 
+## Market Line Shopping
+
+Compares Synth's theoretical option prices against multiple exchanges to identify divergence — like a sports bettor "shopping for lines" to find an edge. Displayed on the Market Context screen (Screen 1b) and used to adjust the Confidence metric.
+
+- **Exchanges:** Aevo, Deribit, OKX (mock providers by default; real adapters can be plugged in).
+- **Divergence metrics per exchange:** avg |Δ| (average absolute %), max |Δ|, signed call/put divergence vs Synth.
+- **Consensus classification:** Strong Agreement (<3%), Moderate (3–7%), Weak (7–15%), Disagreement (>15%).
+- **Confidence adjustment:** Strong agreement nudges confidence up (+0.05); disagreement nudges it down (−0.07). This is a contextual overlay, not a hard guardrail.
+
+To enable real exchange adapters (future), set the following environment variables:
+
+```
+AEVO_API_KEY=...
+DERIBIT_CLIENT_ID=...
+DERIBIT_CLIENT_SECRET=...
+```
+
+When these are unset, Options GPS uses mock providers that perturb Synth prices with realistic exchange-specific biases. This is safe for contributors and CI.
+
 ## Synth API usage
 
 - **`get_prediction_percentiles(asset, horizon)`** — 1h and 24h probabilistic price forecasts; used for fusion state and for payoff/EV (outcome distribution at expiry).
@@ -51,4 +70,4 @@ Prompts: symbol (default BTC), view (bullish/bearish/neutral/vol), risk (low/med
 
 From repo root: `python -m pytest tools/options-gps/tests/ -v`. No API key required (mock data).
 
-Test coverage includes: forecast fusion, strategy generation (all views including vol), PnL calculations for all strategy types, CDF-weighted PoP/EV, ranking with vol bias, vol-specific guardrails, IV estimation, vol comparison, risk plans, hard filters, and end-to-end scripted tests.
+Test coverage includes: forecast fusion, strategy generation (all views including vol), PnL calculations for all strategy types, CDF-weighted PoP/EV, ranking with vol bias, vol-specific guardrails, IV estimation, vol comparison, risk plans, hard filters, multi-exchange divergence computation, mock provider behavior, consensus classification, confidence adjustment for divergence, and end-to-end scripted tests.

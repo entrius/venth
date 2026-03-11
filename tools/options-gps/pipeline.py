@@ -808,6 +808,24 @@ def forecast_confidence(percentiles_last: dict, current_price: float) -> float:
     return max(0.1, 1.0 - (spread - 0.02) / 0.13)
 
 
+def adjust_confidence_for_divergence(base_confidence: float, avg_divergence: float,
+                                     consensus: str) -> float:
+    """Adjust forecast confidence based on multi-exchange divergence.
+    Strong agreement with Synth nudges confidence up; large disagreement nudges it down.
+    The adjustment is intentionally small — line shopping is a contextual overlay,
+    not a hard guardrail."""
+    if avg_divergence <= 0:
+        return base_confidence
+    if consensus == "strong_agreement":
+        return min(1.0, base_confidence + 0.05)
+    if consensus == "moderate_agreement":
+        return base_confidence
+    if consensus == "weak_agreement":
+        return max(0.1, base_confidence - 0.03)
+    # disagreement
+    return max(0.1, base_confidence - 0.07)
+
+
 def is_volatility_elevated(forecast_vol: float, realized_vol: float) -> bool:
     """Adaptive volatility check: forecast is elevated if it exceeds realized by >30% or is in top regime."""
     if realized_vol <= 0:
