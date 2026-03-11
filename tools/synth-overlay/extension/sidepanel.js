@@ -31,6 +31,12 @@ const els = {
   lastUpdate: document.getElementById("lastUpdate"),
   refreshBtn: document.getElementById("refreshBtn"),
   pollProgress: document.getElementById("pollProgress"),
+  balanceInput: document.getElementById("balanceInput"),
+  kellySide: document.getElementById("kellySide"),
+  kellyFraction: document.getElementById("kellyFraction"),
+  kellySize: document.getElementById("kellySize"),
+  kellyEv: document.getElementById("kellyEv"),
+  sizingNote: document.getElementById("sizingNote"),
 };
 
 function fmtCentsFromProb(p) {
@@ -142,6 +148,163 @@ function calcEdgePct(synthProb, polyProb) {
   return Math.round((synthProb - polyProb) * 100);
 }
 
+// ---- Position Sizing (Kelly Criterion) ----
+
+var KELLY_MAX_FRACTION = 0.20; // Hard cap: never risk more than 20% of bankroll
+var BALANCE_STORAGE_KEY = "synth_user_balance";
+
+function formatUsd(v) {
+  if (v == null || !isFinite(v)) return "—";
+  return "$" + v.toFixed(2);
+}
+
+function formatPct(v) {
+  if (v == null || !isFinite(v)) return "—";
+  return (v * 100).toFixed(1) + "%";
+}
+
+/**
+ * Compute Kelly-optimal position sizing for a binary Polymarket bet.
+ *
+ * For a binary outcome paying (1/p_market) on YES:
+ *   b = (1 - p_market) / p_market   (net odds received on a winning $1 bet)
+ *   f* = (b * p_true - (1 - p_true)) / b
+ *
+ * We compute for both YES and NO, pick the side with positive EV,
+ * then scale by confidence and cap at KELLY_MAX_FRACTION.
+ */
+function computeKellySizing(synthProb, marketProb, confidence, balance) {
+  var result = { side: null, fraction: 0, size: 0, evPerDollar: 0 };
+
+  if (synthProb == null || marketProb == null) return result;
+  if (!isFinite(synthProb) || !isFinite(marketProb)) return result;
+  if (marketProb <= 0.01 || marketProb >= 0.99) return result;
+  if (synthProb <= 0 || synthProb >= 1) return result;
+
+  // YES side: true prob = synthProb, market price = marketProb
+  var bYes = (1 - marketProb) / marketProb;
+  var kellyYes = (bYes * synthProb - (1 - synthProb)) / bYes;
+  var evYes = synthProb * bYes - (1 - synthProb); // EV per $1 wagered on YES
+
+  // NO side: true prob = (1 - synthProb), market price = (1 - marketProb)
+  var marketNo = 1 - marketProb;
+  var bNo = (1 - marketNo) / marketNo; // = marketProb / (1 - marketProb)
+  var kellyNo = (bNo * (1 - synthProb) - synthProb) / bNo;
+  var evNo = (1 - synthProb) * bNo - synthProb; // EV per $1 wagered on NO
+
+  var side = null;
+  var rawKelly = 0;
+  var ev = 0;
+
+  if (kellyYes > 0 && evYes > 0 && (kellyYes >= kellyNo || kellyNo <= 0)) {
+    side = "YES";
+    rawKelly = kellyYes;
+    ev = evYes;
+  } else if (kellyNo > 0 && evNo > 0) {
+    side = "NO";
+    rawKelly = kellyNo;
+    ev = evNo;
+  }
+
+  if (!side) return result;
+
+  // Scale by confidence and apply hard cap
+  var confScale = confidence != null && isFinite(confidence) ? confidence : 0.5;
+  var scaledKelly = rawKelly * confScale;
+  if (!isFinite(scaledKelly)) return result;
+  var fraction = Math.min(scaledKelly, KELLY_MAX_FRACTION);
+  fraction = Math.round(fraction * 1000) / 1000; // 3 decimal places
+
+  var size = 0;
+  if (balance != null && balance > 0) {
+    size = Math.round(fraction * balance * 100) / 100;
+  }
+
+  return {
+    side: side,
+    fraction: fraction,
+    size: size,
+    evPerDollar: Math.round(ev * 10000) / 10000,
+  };
+}
+
+function loadStoredBalance(callback) {
+  if (!chrome.storage || !chrome.storage.local) { callback(null); return; }
+  try {
+    chrome.storage.local.get(BALANCE_STORAGE_KEY, function(data) {
+      var val = data && data[BALANCE_STORAGE_KEY];
+      callback(typeof val === "number" && isFinite(val) && val > 0 ? val : null);
+    });
+  } catch (_e) {
+    callback(null);
+  }
+}
+
+function saveStoredBalance(balance) {
+  if (!chrome.storage || !chrome.storage.local) return;
+  if (typeof balance !== "number" || !isFinite(balance) || balance < 0) return;
+  try {
+    var obj = {};
+    obj[BALANCE_STORAGE_KEY] = balance;
+    chrome.storage.local.set(obj);
+  } catch (_e) {}
+}
+
+function updateSizingUI(sizing) {
+  if (!sizing || !sizing.side) {
+    els.kellySide.textContent = "No +EV";
+    els.kellySide.className = "sizing-side-none";
+    els.kellyFraction.textContent = "—";
+    els.kellySize.textContent = els.balanceInput.value ? "$0.00" : "—";
+    els.kellyEv.textContent = "\u2264 0\u00A2";
+    els.sizingNote.classList.add("hidden");
+    return;
+  }
+
+  els.kellySide.textContent = sizing.side;
+  els.kellySide.className = sizing.side === "YES" ? "sizing-side-yes" : "sizing-side-no";
+  els.kellyFraction.textContent = formatPct(sizing.fraction);
+  els.kellySize.textContent = sizing.size > 0 ? formatUsd(sizing.size) : "Enter balance";
+  var evCents = sizing.evPerDollar * 100;
+  els.kellyEv.textContent = (evCents >= 0 ? "+" : "") + evCents.toFixed(1) + "\u00A2";
+
+  // Show contextual note for capped positions
+  if (sizing.fraction >= KELLY_MAX_FRACTION) {
+    els.sizingNote.textContent = "Position capped at " + (KELLY_MAX_FRACTION * 100) + "% of bankroll.";
+    els.sizingNote.classList.remove("hidden");
+  } else {
+    els.sizingNote.classList.add("hidden");
+  }
+}
+
+function initSizing(balanceFromCtx, edgeData, livePrices) {
+  var synthProb = edgeData ? (edgeData.synth_probability_up != null ? edgeData.synth_probability_up : edgeData.synth_probability) : null;
+  // Use live DOM price when available — it's fresher than the API snapshot
+  var marketProb = livePrices && livePrices.upPrice != null ? livePrices.upPrice : (edgeData ? edgeData.polymarket_probability_up : null);
+  var confidence = edgeData ? edgeData.confidence_score : null;
+
+  // Resolve balance: scraped from DOM > stored > manual input
+  var resolveAndUpdate = function(storedBalance) {
+    var balance = null;
+    if (balanceFromCtx != null && balanceFromCtx > 0) {
+      balance = balanceFromCtx;
+      els.balanceInput.value = balance;
+      saveStoredBalance(balance);
+    } else if (storedBalance != null) {
+      balance = storedBalance;
+      if (!els.balanceInput.value) els.balanceInput.value = balance;
+    } else {
+      var manual = parseFloat(els.balanceInput.value);
+      if (!isNaN(manual) && manual > 0) balance = manual;
+    }
+
+    var sizing = computeKellySizing(synthProb, marketProb, confidence, balance);
+    updateSizingUI(sizing);
+  };
+
+  loadStoredBalance(resolveAndUpdate);
+}
+
 // Update UI instantly when live prices change (without full API refresh)
 function updateWithLivePrice(livePrices) {
   if (!cachedSynthData || !livePrices) return;
@@ -178,6 +341,13 @@ function updateWithLivePrice(livePrices) {
   // Update status to show live
   els.statusText.textContent = els.statusText.textContent.replace(/ \(Live\)$/, "") + " (Live)";
   
+  // Recalculate position sizing with updated live price
+  if (cachedSynthData) {
+    var balance = parseFloat(els.balanceInput.value) || null;
+    var sizing = computeKellySizing(synthProbUp, polyProbUp, cachedSynthData.confidence_score, balance);
+    updateSizingUI(sizing);
+  }
+
   console.log("[Synth-Overlay] Live price update:", { polyProbUp, edgePct, signal });
 }
 
@@ -281,9 +451,29 @@ async function refresh() {
     lastUpdate: fmtApiTime(edge.current_time),
   });
   
+  // Initialize position sizing with edge data + scraped balance + live prices
+  initSizing(ctx.balance, edge, ctx.livePrices);
+
   // Reset and start poll progress animation
   startPollProgress();
 }
+
+// Balance input: recalculate sizing on manual entry, persist value
+els.balanceInput.addEventListener("input", function() {
+  var balance = parseFloat(els.balanceInput.value);
+  if (!isNaN(balance) && isFinite(balance) && balance > 0) {
+    saveStoredBalance(balance);
+  }
+  if (cachedSynthData) {
+    var synthProb = cachedSynthData.synth_probability_up != null ? cachedSynthData.synth_probability_up : cachedSynthData.synth_probability;
+    // Prefer live price over stale API price
+    var marketProb = lastPollPrices.upPrice != null ? lastPollPrices.upPrice : cachedSynthData.polymarket_probability_up;
+    var confidence = cachedSynthData.confidence_score;
+    var effectiveBal = (!isNaN(balance) && isFinite(balance) && balance > 0) ? balance : null;
+    var sizing = computeKellySizing(synthProb, marketProb, confidence, effectiveBal);
+    updateSizingUI(sizing);
+  }
+});
 
 els.refreshBtn.addEventListener("click", function() {
   stopPollProgress();

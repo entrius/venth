@@ -19,6 +19,70 @@ Chrome extension that uses Chrome's **native Side Panel** to show Synth market c
 4. **Background service worker** enables/disables side panel per-tab based on URL and runs the alert polling engine.
 5. **Edge alerts** poll watched markets every 60s via `chrome.alarms`. When edge exceeds the user's threshold, a browser notification fires with asset, edge size, signal direction, and confidence. Clicking the notification focuses or opens the relevant Polymarket page. Notifications are suppressed when the user is already viewing the market and have a 5-minute cooldown per market to avoid spam.
 
+## Position Sizing (Kelly Criterion)
+
+The **Position Sizing** card in the side panel answers "how much should I bet?" for a given Polymarket market.
+
+### Balance detection
+
+The content script (`content.js`) scrapes the user's wallet/account balance from the Polymarket DOM using three context-gated strategies:
+
+1. Standalone dollar amounts (`$1,234.56`) near `balance/portfolio/available` keywords in parent elements.
+2. USDC amounts (`1234.56 USDC`) with the same ancestor-context check.
+3. Inline keyword-anchored text (`Balance $1,234.56`, `Available $500.00`).
+
+The side panel pre-fills the **Balance** field with the scraped value when available. The user can override it manually; the value persists in `chrome.storage.local` across sessions. If no balance is detected or stored, the user enters it by hand.
+
+### Inputs
+
+For a given up/down market, the sizing logic uses:
+
+- **p_synth** — Synth probability of YES (`synth_probability_up` from `/api/edge`).
+- **p_market** — Polymarket-implied probability of YES (live DOM price when available, otherwise API snapshot).
+- **confidence_score** — forecast confidence from `EdgeAnalyzer` in [0, 1].
+- **balance** — user bankroll in USD/USDC.
+
+### Expected value per $1
+
+For a binary payoff where you pay `p_market` per share and receive $1 on success:
+
+- YES side: `EV_yes = p_synth × b − (1 − p_synth)` where `b = (1 − p_market) / p_market`
+- NO side: `EV_no = (1 − p_synth) × b_no − p_synth` where `b_no = p_market / (1 − p_market)`
+
+The side with positive EV and positive Kelly fraction is preferred. If neither side is +EV, the UI shows **"No +EV"** and recommended size is $0.
+
+### Kelly fraction
+
+For each side, the Kelly-optimal fraction of bankroll to wager:
+
+```
+b = (1 − p_market) / p_market          # net odds on a winning $1 bet
+f* = (b × p_true − (1 − p_true)) / b   # optimal fraction of bankroll
+```
+
+Where `p_true = p_synth` for YES, `p_true = 1 − p_synth` for NO (with corresponding `p_market`).
+
+### Confidence scaling and risk cap
+
+- Raw Kelly fraction is **scaled by forecast confidence**: `f_scaled = f* × confidence_score`.
+- `confidence_score` reflects forecast distribution width across horizons (from `EdgeAnalyzer.compute_confidence`).
+- A hard **cap of 20%** of bankroll is enforced: `f_final = min(f_scaled, 0.20)`.
+- Final position size: `size = balance × f_final`.
+
+### UI display
+
+- **Side**: `YES` (green), `NO` (red), or `No +EV` (gray).
+- **Kelly fraction**: `f_final` as percentage of bankroll.
+- **Recommended size**: `balance × f_final` in USD.
+- **EV per $1**: expected value per dollar wagered, in cents.
+- **Cap note**: "Position capped at 20% of bankroll" shown only when the cap is active.
+
+### Live updates
+
+Sizing recalculates instantly when:
+- Live Polymarket prices change (via DOM observation + 1s polling).
+- The user edits their balance (on every keystroke).
+
 ## Synth API usage
 
 - `get_polymarket_daily(asset)` — daily up/down (24h) Synth vs Polymarket.

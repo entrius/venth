@@ -168,6 +168,61 @@
     return null;
   }
 
+  /**
+   * Best-effort scrape user's USDC/USD balance from the Polymarket DOM.
+   * Looks for common patterns: "$1,234.56", "Balance 1234.56 USDC", portfolio value display.
+   * Returns a numeric balance or null if not detected.
+   */
+  function scrapeBalance() {
+    var candidates = document.querySelectorAll("span, div, p, strong, [data-testid]");
+    for (var i = 0; i < candidates.length; i++) {
+      var el = candidates[i];
+      var text = (el.textContent || "").trim();
+      if (text.length < 2 || text.length > 40) continue;
+      // Skip elements with many children (containers, not leaf values)
+      if (el.children.length > 3) continue;
+
+      // Pattern 1: "$1,234.56" or "$12.34" standalone
+      var dollarMatch = text.match(/^\$\s*([\d,]+(?:\.\d{1,2})?)\s*$/);
+      if (dollarMatch) {
+        // Walk up to check for balance/portfolio context
+        var parent = el.parentElement;
+        for (var d = 0; d < 4 && parent; d++) {
+          var pText = (parent.textContent || "").toLowerCase();
+          if (pText.length > 120) break;
+          if (/\b(balance|portfolio|available|cash|funds|deposit)\b/.test(pText)) {
+            var val = parseFloat(dollarMatch[1].replace(/,/g, ""));
+            if (val > 0 && val < 1e8) return val;
+          }
+          parent = parent.parentElement;
+        }
+      }
+
+      // Pattern 2: "1234.56 USDC" — require balance/portfolio context in ancestors
+      var usdcMatch = text.match(/([\d,]+(?:\.\d{1,2})?)\s*USDC/i);
+      if (usdcMatch) {
+        var usdcParent = el.parentElement;
+        for (var u = 0; u < 4 && usdcParent; u++) {
+          var uText = (usdcParent.textContent || "").toLowerCase();
+          if (uText.length > 120) break;
+          if (/\b(balance|portfolio|available|cash|funds|deposit)\b/.test(uText)) {
+            var usdcVal = parseFloat(usdcMatch[1].replace(/,/g, ""));
+            if (usdcVal > 0 && usdcVal < 1e8) return usdcVal;
+          }
+          usdcParent = usdcParent.parentElement;
+        }
+      }
+
+      // Pattern 3: "Balance $1,234.56" — keyword anchored in the element itself
+      var balMatch = text.match(/\b(?:balance|available|portfolio)\s*:?\s*\$\s*([\d,]+(?:\.\d{1,2})?)/i);
+      if (balMatch) {
+        var balVal = parseFloat(balMatch[1].replace(/,/g, ""));
+        if (balVal > 0 && balVal < 1e8) return balVal;
+      }
+    }
+    return null;
+  }
+
   function getContext() {
     var livePrices = scrapeLivePrices();
     return {
@@ -176,6 +231,7 @@
       host: window.location.hostname,
       pageUpdatedAt: Date.now(),
       livePrices: livePrices,
+      balance: scrapeBalance(),
     };
   }
 

@@ -67,6 +67,22 @@
       <p id="invalidationText" class="text muted">—</p>
     </section>
 
+    <section class="card" id="sizingCard">
+      <div class="label">Position Sizing</div>
+      <div class="sizing-balance-row">
+        <span>Balance</span>
+        <div class="sizing-balance-input">
+          <span class="sizing-currency">$</span>
+          <input type="number" id="balanceInput" min="0" step="1" placeholder="Enter balance" />
+        </div>
+      </div>
+      <div class="row sizing-row"><span>Side</span><strong id="kellySide">—</strong></div>
+      <div class="row sizing-row"><span>Kelly fraction</span><strong id="kellyFraction">—</strong></div>
+      <div class="row sizing-row"><span>Recommended size</span><strong id="kellySize">—</strong></div>
+      <div class="row sizing-row"><span>EV per $1</span><strong id="kellyEv">—</strong></div>
+      <div id="sizingNote" class="sizing-note hidden"></div>
+    </section>
+
     <section class="card" id="alertsCard">
       <div class="alert-header">
         <div class="label" style="margin-bottom:0">Alerts</div>
