@@ -47,6 +47,32 @@ python tools/options-gps/main.py --symbol BTC --view vol --risk medium --no-prom
 
 Prompts: symbol (default BTC), view (bullish/bearish/neutral/vol), risk (low/medium/high). Uses mock data when no `SYNTH_API_KEY` is set.
 
+## Exchange configuration (Market Line Shopping)
+
+Options GPS compares Synth's theoretical option prices against exchanges (Aevo, Deribit) for **Market Line Shopping** and best execution.
+
+**Live execution:** When API keys are set, the tool performs real network calls for live quotes:
+
+- **Deribit:** Public REST API (`get_book_summary_by_currency`), no auth required for market data.
+- **Aevo:** REST API (`/options`) when `AEVO_API_KEY` is set.
+
+When keys are unset or calls fail, it falls back to a mock multi-exchange provider.
+
+Environment variables:
+
+- `AEVO_API_KEY` — for Aevo live options data
+- `DERIBIT_CLIENT_ID` / `DERIBIT_CLIENT_SECRET` — optional; Deribit market data is public
+
+**Best execution (high-signal UI):** The Top Plays screen explicitly points to the winner — which venue offers the best execution price for the recommended strategy. For each Best Match card, it shows: `Best execution: {venue} (${cost} debit/credit)`.
+
+**Edge detection (alpha over agreement):** Confidence is adjusted based on how much Synth deviates from the market. Higher divergence from the market mean (modeled via z-score: `z = (synth - mean) / std`) increases conviction — alpha comes from disagreement, not consensus. This feeds into the overall confidence bar and guardrails.
+
+To configure:
+
+1. Copy `.env.example` at the repo root to `.env`.
+2. Fill in your API keys.
+3. Load the env file in your shell.
+
 ## Tests
 
 From repo root: `python -m pytest tools/options-gps/tests/ -v`. No API key required (mock data).
