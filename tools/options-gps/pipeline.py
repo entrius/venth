@@ -697,13 +697,16 @@ def rank_strategies(
     volatility_ratio: float = 1.0,
     cdf_values: list[float] | None = None,
     vol_bias: VolBias | None = None,
+    divergence_by_strategy: dict | None = None,
 ) -> list[ScoredStrategy]:
     """Score and sort strategies. Returns list of ScoredStrategy sorted by score desc.
     volatility_ratio = forecast_vol / realized_vol (1.0 = normal). When elevated,
     defined-risk strategies get a bonus and naked/premium strategies get a penalty.
     cdf_values enables probability-weighted PoP/EV when provided.
     vol_bias controls scoring for vol view: long_vol favours straddles/strangles,
-    short_vol favours iron condors and short straddles/strangles."""
+    short_vol favours iron condors and short straddles/strangles.
+    divergence_by_strategy maps id(candidate) -> z_score for exchange edge detection.
+    Higher |z| = stronger conviction (alpha is in disagreement, not consensus)."""
     vol_elevated = volatility_ratio > 1.15
     scored: list[ScoredStrategy] = []
     for c in candidates:
@@ -745,6 +748,11 @@ def rank_strategies(
                 score -= 0.10
         if view != "vol":
             score *= confidence
+        if divergence_by_strategy is not None:
+            div = divergence_by_strategy.get(id(c))
+            if div is not None:
+                div_bonus = max(-0.15, min(0.15, div * 0.06))
+                score += div_bonus
         invalidation, reroute, review_time = _risk_plan(c)
         ev_pct = (ev / current_price * 100) if current_price > 0 else 0.0
         vol_note = ""
