@@ -9,7 +9,6 @@ from exchanges import (
     compute_divergence,
     get_market_lines,
     MockExchangeProvider,
-    DivergenceSummary,
     MarketLineResult,
     _classify_consensus,
     _default_providers,
