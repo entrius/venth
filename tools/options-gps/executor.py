@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable
 
+import requests
+
 from exchange import best_execution_price, leg_divergences
 
 
@@ -141,25 +143,40 @@ class DryRunExecutor(BaseExecutor):
         )
 
 
+def _is_retryable(err: Exception) -> bool:
+    """True for transient errors worth retrying."""
+    if isinstance(err, (requests.Timeout, requests.ConnectionError)):
+        return True
+    if isinstance(err, requests.HTTPError) and err.response is not None:
+        return err.response.status_code in (429, 502, 503)
+    return False
+
+
 def _deribit_rpc(base_url: str, method: str, params: dict, token: str | None) -> dict:
-    """Send one JSON-RPC 2.0 request to Deribit. POST to base_url/method with JSON-RPC body."""
-    import requests
+    """Send one JSON-RPC 2.0 request to Deribit. POST to base_url/method with JSON-RPC body. Retries on transient errors."""
     url = f"{base_url.rstrip('/')}/{method}"
     payload = {"jsonrpc": "2.0", "method": method, "params": params, "id": int(time.time() * 1000)}
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    resp = requests.post(
-        url,
-        data=json.dumps(payload),
-        headers=headers,
-        timeout=10,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    if "error" in data:
-        raise RuntimeError(data["error"].get("message", str(data["error"])))
-    return data.get("result", {})
+    for attempt in range(3):
+        try:
+            resp = requests.post(
+                url,
+                data=json.dumps(payload),
+                headers=headers,
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if "error" in data:
+                raise RuntimeError(data["error"].get("message", str(data["error"])))
+            return data.get("result", {})
+        except Exception as e:
+            if _is_retryable(e) and attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            raise
 
 
 class DeribitExecutor(BaseExecutor):
@@ -174,6 +191,8 @@ class DeribitExecutor(BaseExecutor):
         self.token: str | None = None
 
     def authenticate(self) -> bool:
+        if self.token:
+            return True
         try:
             result = _deribit_rpc(
                 self.base_url,
@@ -192,9 +211,10 @@ class DeribitExecutor(BaseExecutor):
 
     def place_order(self, order: OrderRequest) -> OrderResult:
         method = "private/buy" if order.action == "BUY" else "private/sell"
+        # Use contracts for options (unambiguous); amount is in underlying for options on Deribit.
         params = {
             "instrument_name": order.instrument,
-            "amount": order.quantity,
+            "contracts": order.quantity,
             "type": order.order_type,
         }
         if order.order_type == "limit":
@@ -248,7 +268,6 @@ class AevoExecutor(BaseExecutor):
         return bool(self.api_key and self.api_secret)
 
     def place_order(self, order: OrderRequest) -> OrderResult:
-        import requests
         payload = {
             "instrument": order.instrument,
             "side": order.action.lower(),
@@ -258,30 +277,41 @@ class AevoExecutor(BaseExecutor):
         if order.order_type == "limit":
             payload["price"] = order.price
         body = json.dumps(payload)
-        try:
-            resp = requests.post(
-                f"{self.base_url}/orders",
-                data=body,
-                headers=self._headers(body),
-                timeout=10,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            return OrderResult(
-                order_id=data.get("order_id", ""),
-                status=data.get("status", "error"),
-                fill_price=float(data.get("avg_price", 0)),
-                fill_quantity=int(data.get("filled", 0)),
-                instrument=order.instrument,
-                action=order.action,
-                exchange="aevo",
-            )
-        except Exception as e:
-            return OrderResult(
-                order_id="", status="error", fill_price=0.0, fill_quantity=0,
-                instrument=order.instrument, action=order.action, exchange="aevo",
-                error=str(e),
-            )
+        last_err = None
+        for attempt in range(3):
+            try:
+                resp = requests.post(
+                    f"{self.base_url}/orders",
+                    data=body,
+                    headers=self._headers(body),
+                    timeout=10,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                return OrderResult(
+                    order_id=data.get("order_id", ""),
+                    status=data.get("status", "error"),
+                    fill_price=float(data.get("avg_price", 0)),
+                    fill_quantity=int(data.get("filled", 0)),
+                    instrument=order.instrument,
+                    action=order.action,
+                    exchange="aevo",
+                )
+            except Exception as e:
+                last_err = e
+                if _is_retryable(e) and attempt < 2:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                return OrderResult(
+                    order_id="", status="error", fill_price=0.0, fill_quantity=0,
+                    instrument=order.instrument, action=order.action, exchange="aevo",
+                    error=str(e),
+                )
+        return OrderResult(
+            order_id="", status="error", fill_price=0.0, fill_quantity=0,
+            instrument=order.instrument, action=order.action, exchange="aevo",
+            error=str(last_err),
+        )
 
 
 def build_execution_plan(

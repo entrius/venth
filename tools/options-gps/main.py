@@ -939,9 +939,14 @@ def main():
         "higher_upside": _card_to_log(upside, divergence_by_strategy.get(id(upside.strategy)) if divergence_by_strategy and upside else None),
     }
     if execution_report is not None:
+        testnet = (
+            os.environ.get("DERIBIT_TESTNET", "").strip() == "1"
+            or os.environ.get("AEVO_TESTNET", "").strip() == "1"
+        )
         decision_log["execution"] = {
             "mode": "dry_run" if execution_report.plan.dry_run else "live",
             "exchange": execution_report.plan.exchange,
+            "testnet": testnet,
             "all_filled": execution_report.all_filled,
             "net_cost": round(execution_report.net_cost, 2),
             "fills": [
