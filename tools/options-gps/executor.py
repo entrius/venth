@@ -1,6 +1,8 @@
 """Autonomous execution engine for Options GPS.
 Consumes pipeline data classes and exchange pricing. Supports Deribit (JSON-RPC),
-Aevo (REST + HMAC), and dry-run simulation. Auto-routing uses leg_divergences per leg."""
+Aevo (REST + HMAC), and dry-run simulation. Auto-routing uses leg_divergences per leg.
+Features: order lifecycle (place/status/cancel), slippage protection, order monitoring
+with timeout, retry on transient errors, partial-fill cancellation."""
 
 import hashlib
 import hmac
@@ -10,7 +12,7 @@ import time
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Callable
 
 import requests
@@ -36,13 +38,16 @@ class OrderRequest:
 class OrderResult:
     """Result of placing one order."""
     order_id: str
-    status: str       # "filled" | "open" | "rejected" | "error" | "simulated"
+    status: str       # "filled" | "open" | "rejected" | "error" | "simulated" | "cancelled"
     fill_price: float
     fill_quantity: int
     instrument: str
     action: str
     exchange: str
     error: str | None = None
+    timestamp: str = ""          # ISO 8601 when fill/status was recorded
+    slippage_pct: float = 0.0    # (fill_price - expected_price) / expected_price * 100
+    latency_ms: int = 0          # round-trip latency in milliseconds
 
 
 @dataclass
@@ -57,6 +62,9 @@ class ExecutionPlan:
     estimated_cost: float = 0.0
     estimated_max_loss: float = 0.0
     dry_run: bool = False
+    max_slippage_pct: float = 0.0   # 0 = no slippage check
+    timeout_seconds: int = 0        # 0 = no monitoring (fire-and-forget)
+    quantity_override: int = 0      # 0 = use strategy quantity
 
 
 @dataclass
@@ -67,6 +75,9 @@ class ExecutionReport:
     all_filled: bool = False
     net_cost: float = 0.0
     summary: str = ""
+    started_at: str = ""          # ISO 8601
+    finished_at: str = ""         # ISO 8601
+    cancelled_orders: list[str] = field(default_factory=list)  # order_ids cancelled on failure
 
 
 def deribit_instrument_name(asset: str, expiry: str, strike: float, option_type: str) -> str:
@@ -96,8 +107,24 @@ def _format_deribit_date(expiry: str) -> str:
         return "UNKNOWN"
 
 
+def _now_iso() -> str:
+    """Current UTC time in ISO 8601."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _slippage_pct(expected: float, actual: float, action: str) -> float:
+    """Compute slippage as a percentage. Positive = worse than expected.
+    For BUY: paying more is positive slippage. For SELL: receiving less is positive."""
+    if expected <= 0:
+        return 0.0
+    if action == "BUY":
+        return (actual - expected) / expected * 100
+    return (expected - actual) / expected * 100
+
+
 class BaseExecutor(ABC):
-    """Abstract executor for one exchange (or dry-run)."""
+    """Abstract executor for one exchange (or dry-run).
+    Full order lifecycle: authenticate → place → status → cancel."""
 
     @abstractmethod
     def authenticate(self) -> bool:
@@ -106,6 +133,14 @@ class BaseExecutor(ABC):
     @abstractmethod
     def place_order(self, order: OrderRequest) -> OrderResult:
         pass
+
+    @abstractmethod
+    def get_order_status(self, order_id: str) -> OrderResult:
+        """Poll current status of a previously placed order."""
+
+    @abstractmethod
+    def cancel_order(self, order_id: str) -> bool:
+        """Cancel an open order. Returns True if successfully cancelled."""
 
 
 class DryRunExecutor(BaseExecutor):
@@ -113,17 +148,20 @@ class DryRunExecutor(BaseExecutor):
 
     def __init__(self, exchange_quotes: list):
         self.exchange_quotes = exchange_quotes
+        self._orders: dict[str, OrderResult] = {}  # track placed orders for status queries
 
     def authenticate(self) -> bool:
         return True
 
     def place_order(self, order: OrderRequest) -> OrderResult:
+        ts = _now_iso()
         if not order.strike or not order.option_type:
             return OrderResult(
                 order_id=f"dry-{uuid.uuid4().hex[:8]}",
                 status="error", fill_price=0.0, fill_quantity=0,
                 instrument=order.instrument, action=order.action,
                 exchange="dry_run", error="Missing strike or option_type on order",
+                timestamp=ts,
             )
         quote = best_execution_price(
             self.exchange_quotes, order.strike, order.option_type, order.action,
@@ -132,7 +170,8 @@ class DryRunExecutor(BaseExecutor):
             fill_price = order.price
         else:
             fill_price = quote.ask if order.action == "BUY" else quote.bid
-        return OrderResult(
+        slip = _slippage_pct(order.price, fill_price, order.action)
+        result = OrderResult(
             order_id=f"dry-{uuid.uuid4().hex[:8]}",
             status="simulated",
             fill_price=fill_price,
@@ -140,7 +179,32 @@ class DryRunExecutor(BaseExecutor):
             instrument=order.instrument,
             action=order.action,
             exchange="dry_run",
+            timestamp=ts,
+            slippage_pct=round(slip, 4),
         )
+        self._orders[result.order_id] = result
+        return result
+
+    def get_order_status(self, order_id: str) -> OrderResult:
+        if order_id in self._orders:
+            return self._orders[order_id]
+        return OrderResult(
+            order_id=order_id, status="error", fill_price=0.0, fill_quantity=0,
+            instrument="", action="", exchange="dry_run",
+            error="Order not found", timestamp=_now_iso(),
+        )
+
+    def cancel_order(self, order_id: str) -> bool:
+        if order_id in self._orders:
+            old = self._orders[order_id]
+            self._orders[order_id] = OrderResult(
+                order_id=order_id, status="cancelled",
+                fill_price=old.fill_price, fill_quantity=0,
+                instrument=old.instrument, action=old.action,
+                exchange="dry_run", timestamp=_now_iso(),
+            )
+            return True
+        return False
 
 
 def _is_retryable(err: Exception) -> bool:
@@ -219,24 +283,64 @@ class DeribitExecutor(BaseExecutor):
         }
         if order.order_type == "limit":
             params["price"] = order.price
+        t0 = time.monotonic()
         try:
             result = _deribit_rpc(self.base_url, method, params, self.token)
+            latency = int((time.monotonic() - t0) * 1000)
             order_data = result.get("order", {})
+            fill_price = float(order_data.get("average_price", 0))
+            slip = _slippage_pct(order.price, fill_price, order.action) if fill_price > 0 else 0.0
             return OrderResult(
                 order_id=order_data.get("order_id", ""),
                 status=order_data.get("order_state", "error"),
-                fill_price=float(order_data.get("average_price", 0)),
+                fill_price=fill_price,
                 fill_quantity=int(order_data.get("filled_amount", 0)),
                 instrument=order.instrument,
                 action=order.action,
                 exchange="deribit",
+                timestamp=_now_iso(),
+                slippage_pct=round(slip, 4),
+                latency_ms=latency,
             )
         except Exception as e:
             return OrderResult(
                 order_id="", status="error", fill_price=0.0, fill_quantity=0,
                 instrument=order.instrument, action=order.action, exchange="deribit",
-                error=str(e),
+                error=str(e), timestamp=_now_iso(),
             )
+
+    def get_order_status(self, order_id: str) -> OrderResult:
+        try:
+            result = _deribit_rpc(
+                self.base_url, "private/get_order_state",
+                {"order_id": order_id}, self.token,
+            )
+            return OrderResult(
+                order_id=result.get("order_id", order_id),
+                status=result.get("order_state", "error"),
+                fill_price=float(result.get("average_price", 0)),
+                fill_quantity=int(result.get("filled_amount", 0)),
+                instrument=result.get("instrument_name", ""),
+                action="BUY" if result.get("direction") == "buy" else "SELL",
+                exchange="deribit",
+                timestamp=_now_iso(),
+            )
+        except Exception as e:
+            return OrderResult(
+                order_id=order_id, status="error", fill_price=0.0, fill_quantity=0,
+                instrument="", action="", exchange="deribit",
+                error=str(e), timestamp=_now_iso(),
+            )
+
+    def cancel_order(self, order_id: str) -> bool:
+        try:
+            _deribit_rpc(
+                self.base_url, "private/cancel",
+                {"order_id": order_id}, self.token,
+            )
+            return True
+        except Exception:
+            return False
 
 
 class AevoExecutor(BaseExecutor):
@@ -249,18 +353,18 @@ class AevoExecutor(BaseExecutor):
             "https://api-testnet.aevo.xyz" if testnet else "https://api.aevo.xyz"
         )
 
-    def _sign(self, timestamp: str, body: str) -> str:
-        message = f"{timestamp}{body}"
+    def _sign(self, timestamp: str, method: str, path: str, body: str) -> str:
+        message = f"{timestamp}{method}{path}{body}"
         return hmac.new(
             self.api_secret.encode(), message.encode(), hashlib.sha256,
         ).hexdigest()
 
-    def _headers(self, body: str = "") -> dict:
+    def _headers(self, method: str = "POST", path: str = "/orders", body: str = "") -> dict:
         ts = str(int(time.time()))
         return {
             "AEVO-KEY": self.api_key,
             "AEVO-TIMESTAMP": ts,
-            "AEVO-SIGNATURE": self._sign(ts, body),
+            "AEVO-SIGNATURE": self._sign(ts, method, path, body),
             "Content-Type": "application/json",
         }
 
@@ -278,24 +382,31 @@ class AevoExecutor(BaseExecutor):
             payload["price"] = order.price
         body = json.dumps(payload)
         last_err = None
+        t0 = time.monotonic()
         for attempt in range(3):
             try:
                 resp = requests.post(
                     f"{self.base_url}/orders",
                     data=body,
-                    headers=self._headers(body),
+                    headers=self._headers("POST", "/orders", body),
                     timeout=10,
                 )
                 resp.raise_for_status()
+                latency = int((time.monotonic() - t0) * 1000)
                 data = resp.json()
+                fill_price = float(data.get("avg_price", 0))
+                slip = _slippage_pct(order.price, fill_price, order.action) if fill_price > 0 else 0.0
                 return OrderResult(
                     order_id=data.get("order_id", ""),
                     status=data.get("status", "error"),
-                    fill_price=float(data.get("avg_price", 0)),
+                    fill_price=fill_price,
                     fill_quantity=int(data.get("filled", 0)),
                     instrument=order.instrument,
                     action=order.action,
                     exchange="aevo",
+                    timestamp=_now_iso(),
+                    slippage_pct=round(slip, 4),
+                    latency_ms=latency,
                 )
             except Exception as e:
                 last_err = e
@@ -305,13 +416,53 @@ class AevoExecutor(BaseExecutor):
                 return OrderResult(
                     order_id="", status="error", fill_price=0.0, fill_quantity=0,
                     instrument=order.instrument, action=order.action, exchange="aevo",
-                    error=str(e),
+                    error=str(e), timestamp=_now_iso(),
                 )
         return OrderResult(
             order_id="", status="error", fill_price=0.0, fill_quantity=0,
             instrument=order.instrument, action=order.action, exchange="aevo",
-            error=str(last_err),
+            error=str(last_err), timestamp=_now_iso(),
         )
+
+    def get_order_status(self, order_id: str) -> OrderResult:
+        path = f"/orders/{order_id}"
+        try:
+            resp = requests.get(
+                f"{self.base_url}{path}",
+                headers=self._headers("GET", path),
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return OrderResult(
+                order_id=data.get("order_id", order_id),
+                status=data.get("status", "error"),
+                fill_price=float(data.get("avg_price", 0)),
+                fill_quantity=int(data.get("filled", 0)),
+                instrument=data.get("instrument", ""),
+                action=data.get("side", "").upper(),
+                exchange="aevo",
+                timestamp=_now_iso(),
+            )
+        except Exception as e:
+            return OrderResult(
+                order_id=order_id, status="error", fill_price=0.0, fill_quantity=0,
+                instrument="", action="", exchange="aevo",
+                error=str(e), timestamp=_now_iso(),
+            )
+
+    def cancel_order(self, order_id: str) -> bool:
+        path = f"/orders/{order_id}"
+        try:
+            resp = requests.delete(
+                f"{self.base_url}{path}",
+                headers=self._headers("DELETE", path),
+                timeout=10,
+            )
+            resp.raise_for_status()
+            return True
+        except Exception:
+            return False
 
 
 def build_execution_plan(
@@ -320,6 +471,9 @@ def build_execution_plan(
     exchange: str | None,
     exchange_quotes: list,
     synth_options: dict,
+    quantity_override: int = 0,
+    max_slippage_pct: float = 0.0,
+    timeout_seconds: int = 0,
 ) -> ExecutionPlan:
     """Build ExecutionPlan from a ScoredStrategy. When exchange is None, auto-route per leg."""
     strategy = scored.strategy
@@ -330,6 +484,9 @@ def build_execution_plan(
         asset=asset,
         expiry=strategy.expiry or "",
         dry_run=False,
+        quantity_override=quantity_override,
+        max_slippage_pct=max_slippage_pct,
+        timeout_seconds=timeout_seconds,
     )
     leg_routes = {}
     if exchange is None:
@@ -360,10 +517,11 @@ def build_execution_plan(
         else:
             price = leg.premium
 
+        qty = plan.quantity_override if plan.quantity_override > 0 else leg.quantity
         plan.orders.append(OrderRequest(
             instrument=instrument,
             action=leg.action,
-            quantity=leg.quantity,
+            quantity=qty,
             order_type="limit",
             price=price,
             exchange=leg_exchange,
@@ -395,12 +553,51 @@ def validate_plan(plan: ExecutionPlan) -> tuple[bool, str]:
     return True, ""
 
 
+def _monitor_order(
+    executor: BaseExecutor,
+    order_id: str,
+    timeout_seconds: int,
+    poll_interval: float = 1.0,
+) -> OrderResult:
+    """Poll order status until filled, rejected, or timeout."""
+    deadline = time.monotonic() + timeout_seconds
+    last_result = None
+    while time.monotonic() < deadline:
+        last_result = executor.get_order_status(order_id)
+        if last_result.status in ("filled", "rejected", "error", "cancelled", "simulated"):
+            return last_result
+        time.sleep(max(0, min(poll_interval, deadline - time.monotonic())))
+    if last_result and last_result.status == "open":
+        last_result.error = f"Timeout after {timeout_seconds}s — order still open"
+    return last_result or OrderResult(
+        order_id=order_id, status="error", fill_price=0.0, fill_quantity=0,
+        instrument="", action="", exchange="",
+        error=f"Timeout after {timeout_seconds}s", timestamp=_now_iso(),
+    )
+
+
+def _cancel_filled_orders(
+    filled_results: list[OrderResult],
+    get_exec: Callable[[str], BaseExecutor],
+) -> list[str]:
+    """Best-effort cancel of previously filled orders. Returns list of cancelled order_ids."""
+    cancelled = []
+    for r in filled_results:
+        if r.order_id and r.status in ("filled", "simulated", "open"):
+            executor = get_exec(r.exchange)
+            if executor.cancel_order(r.order_id):
+                cancelled.append(r.order_id)
+    return cancelled
+
+
 def execute_plan(
     plan: ExecutionPlan,
     executor_or_factory: BaseExecutor | Callable[[str], BaseExecutor],
 ) -> ExecutionReport:
-    """Execute all orders. If executor_or_factory is callable, call it with order.exchange per order (for auto)."""
-    report = ExecutionReport(plan=plan)
+    """Execute all orders. Supports slippage protection, order monitoring with timeout,
+    and automatic cancellation of filled legs on partial failure.
+    If executor_or_factory is callable, call it with order.exchange per order (for auto)."""
+    report = ExecutionReport(plan=plan, started_at=_now_iso())
     get_executor: Callable[[str], BaseExecutor] = (
         executor_or_factory if callable(executor_or_factory) else lambda _: executor_or_factory
     )
@@ -411,28 +608,68 @@ def execute_plan(
             report.summary = "Authentication failed"
             report.all_filled = False
             report.net_cost = _compute_net_cost(report.results)
+            report.finished_at = _now_iso()
             return report
         result = executor.place_order(order)
+
+        # Order monitoring: if timeout is set and order is open, poll until filled or timeout
+        if plan.timeout_seconds > 0 and result.status == "open" and result.order_id:
+            result = _monitor_order(executor, result.order_id, plan.timeout_seconds)
+            # If still open after timeout, cancel it
+            if result.status == "open":
+                executor.cancel_order(result.order_id)
+                result.status = "cancelled"
+                result.error = f"Cancelled after {plan.timeout_seconds}s timeout"
+
+        # Slippage protection: reject if fill slippage exceeds threshold
+        if (plan.max_slippage_pct > 0
+                and result.status in ("filled", "simulated")
+                and result.slippage_pct > plan.max_slippage_pct):
+            # Cancel this order if possible
+            if result.order_id:
+                executor.cancel_order(result.order_id)
+            result = OrderResult(
+                order_id=result.order_id,
+                status="rejected",
+                fill_price=result.fill_price,
+                fill_quantity=result.fill_quantity,
+                instrument=result.instrument,
+                action=result.action,
+                exchange=result.exchange,
+                error=f"Slippage {result.slippage_pct:.2f}% exceeds max {plan.max_slippage_pct:.2f}%",
+                timestamp=_now_iso(),
+                slippage_pct=result.slippage_pct,
+                latency_ms=result.latency_ms,
+            )
+
         report.results.append(result)
-        if result.status in ("error", "rejected"):
+        if result.status in ("error", "rejected", "cancelled"):
             filled = [r for r in report.results if r.status in ("filled", "simulated")]
             if filled:
+                # Auto-cancel previously filled legs on partial failure
+                report.cancelled_orders = _cancel_filled_orders(filled, get_executor)
                 instruments = ", ".join(r.instrument for r in filled)
+                cancel_note = (
+                    f" Auto-cancelled {len(report.cancelled_orders)} filled legs."
+                    if report.cancelled_orders
+                    else f" WARNING: manually close filled legs: {instruments}"
+                )
                 report.summary = (
                     f"Partial fill — order {order.leg_index} failed: "
-                    f"{result.error or result.status}. "
-                    f"WARNING: manually close filled legs: {instruments}"
+                    f"{result.error or result.status}.{cancel_note}"
                 )
             else:
                 report.summary = f"Order {order.leg_index} failed: {result.error or result.status}"
             report.all_filled = False
             report.net_cost = _compute_net_cost(report.results)
+            report.finished_at = _now_iso()
             return report
 
     report.all_filled = all(
         r.status in ("filled", "simulated") for r in report.results
     )
     report.net_cost = _compute_net_cost(report.results)
+    report.finished_at = _now_iso()
     if report.all_filled:
         mode = "simulated" if plan.dry_run else "live"
         report.summary = (

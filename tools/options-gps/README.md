@@ -9,7 +9,7 @@ Turn a trader's view into one clear options decision. Inputs: **symbol**, **mark
 - **Screen 2 (Top Plays):** Three ranked cards: Best Match (highest score for view), Safer Alternative (higher win probability), Higher Upside (higher expected payoff). Each shows why it fits, chance of profit, max loss, "Review again at" time.
 - **Screen 3 (Why This Works):** Distribution view and plain-English explanation for the best match (Synth 1h + 24h fusion state, required market behavior).
 - **Screen 4 (If Wrong):** Exit rule, convert/roll rule, time-based reassessment rule.
-- **Screen 5 (Execution):** When `--execute` or `--dry-run` is used, shows order plan, optional confirmation (live only), and per-leg fill results with net cost.
+- **Screen 5 (Execution):** When `--execute` or `--dry-run` is used, shows order plan, optional confirmation (live only), per-leg fill results with slippage and latency metrics, net cost, and execution timestamps.
 
 **Guardrails:** No-trade state when confidence is low, signals conflict (e.g. 1h vs 24h countermove), volatility is very high (directional views), or no vol edge exists (vol view with similar Synth/market IV).
 
@@ -36,7 +36,9 @@ Data flow for crypto assets (BTC, ETH, SOL):
 1. **Synth** → forecast percentiles, option pricing, volatility (via `SynthClient`).
 2. **Pipeline** → strategy generation, payoff/EV, ranking (with optional exchange divergence bonus).
 3. **Exchange (read)** → `exchange.py` fetches live or mock quotes from Deribit and Aevo; `leg_divergences()` computes per-leg best venue and price (lowest ask for BUY, highest bid for SELL).
-4. **Execution** → `executor.py` builds an `ExecutionPlan` from the chosen strategy card, resolves instrument names per exchange (Deribit: `BTC-DDMonYY-STRIKE-C|P`; Aevo: `BTC-STRIKE-C|P`), and either simulates (dry-run) or submits orders. Deribit uses **JSON-RPC 2.0 over HTTP (POST)**; Aevo uses REST with HMAC-SHA256 signing. When `--exchange` is not set, each leg is auto-routed to its best venue (per `leg_divergences`); live execution uses one executor per leg when routing is mixed.
+4. **Execution** → `executor.py` builds an `ExecutionPlan` from the chosen strategy card, resolves instrument names per exchange (Deribit: `BTC-DDMonYY-STRIKE-C|P`; Aevo: `BTC-STRIKE-C|P`), and either simulates (dry-run) or submits orders. Deribit uses **JSON-RPC 2.0 over HTTP (POST)**; Aevo uses REST with HMAC-SHA256 signing (method + path + body in signature). When `--exchange` is not set, each leg is auto-routed to its best venue (per `leg_divergences`); live execution uses one executor per leg when routing is mixed.
+5. **Order lifecycle** → Full lifecycle management: place → poll status → cancel. After placement, orders can be monitored with `--timeout` (poll until filled or cancel on expiry). Partial failures trigger automatic cancellation of already-filled legs.
+6. **Safety controls** → Slippage protection (`--max-slippage`) rejects fills that deviate beyond threshold. Quantity override (`--quantity`) sets contract count for all legs.
 
 Credentials are read from the environment (no secrets in code). Dry-run requires no credentials.
 
@@ -50,6 +52,9 @@ Execution is supported only for **crypto assets** (BTC, ETH, SOL). Use `--execut
 - **`--dry-run`** — Simulate execution using current exchange quotes; no API keys needed and no real orders.
 - **`--force`** — Allow live execution when the guardrail recommends no trade (e.g. signals unclear). Without `--force`, the CLI exits with an error in that case.
 - **`--exchange deribit|aevo`** — Force all legs to one exchange. Default: auto-route each leg to the best venue.
+- **`--max-slippage N`** — Max allowed slippage % per fill (reject and cancel if exceeded, 0=off).
+- **`--quantity N`** — Override contract quantity for all legs (0=use strategy default).
+- **`--timeout N`** — Seconds to wait for each order fill before cancelling (0=fire-and-forget).
 
 **Environment variables (live execution only):**
 
@@ -60,7 +65,7 @@ Execution is supported only for **crypto assets** (BTC, ETH, SOL). Use `--execut
 | `AEVO_API_KEY` / `AEVO_API_SECRET` | Aevo API credentials |
 | `AEVO_TESTNET=1` | Use Aevo testnet |
 
-**Safety:** When the pipeline sets a no-trade reason (e.g. low confidence, conflicting signals), live execution is refused unless `--force` is set. Dry-run is always allowed for testing. The decision log JSON includes an `execution` block with mode, fills, and net cost when execution or dry-run was run.
+**Safety:** When the pipeline sets a no-trade reason (e.g. low confidence, conflicting signals), live execution is refused unless `--force` is set. Dry-run is always allowed for testing. Slippage protection rejects fills exceeding `--max-slippage` threshold and auto-cancels the order. On partial multi-leg failure, already-filled legs are automatically cancelled (best-effort) to avoid dangling positions. The decision log JSON includes an `execution` block with mode, fills (including per-leg slippage %, latency ms, timestamps), cancelled orders, and net cost.
 
 ## Synth API usage
 
@@ -91,4 +96,4 @@ Prompts: symbol (default BTC), view (bullish/bearish/neutral/vol), risk (low/med
 
 From repo root: `python -m pytest tools/options-gps/tests/ -v`. No API key required (mock data).
 
-Test coverage includes: forecast fusion, strategy generation (all views including vol), PnL calculations for all strategy types, CDF-weighted PoP/EV, ranking with vol bias, vol-specific guardrails, IV estimation, vol comparison, risk plans, hard filters, exchange data fetching/parsing, divergence computation, line shopping ranking integration, end-to-end scripted tests, **execution** (instrument names, plan build/validate, dry-run executor, auto-routing, get_executor factory, guardrail refusal when no-trade and no --force), and full-pipeline-to-dry-run E2E.
+Test coverage includes: forecast fusion, strategy generation (all views including vol), PnL calculations for all strategy types, CDF-weighted PoP/EV, ranking with vol bias, vol-specific guardrails, IV estimation, vol comparison, risk plans, hard filters, exchange data fetching/parsing, divergence computation, line shopping ranking integration, end-to-end scripted tests, **execution** (instrument names, plan build/validate, dry-run executor, order lifecycle — get_order_status/cancel_order, slippage computation and protection, execution timestamps and latency, summary message verification, quantity override, auto-routing, get_executor factory, guardrail refusal when no-trade and no --force), full-pipeline-to-dry-run E2E, multi-leg execution E2E, non-crypto skip E2E, and slippage protection E2E.

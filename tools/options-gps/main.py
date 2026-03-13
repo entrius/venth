@@ -685,12 +685,20 @@ def screen_execution(
     synth_options: dict,
     dry_run: bool = False,
     no_prompt: bool = False,
+    max_slippage: float = 0.0,
+    quantity: int = 0,
+    timeout: int = 0,
 ):
     """Screen 5: build plan, confirm (if live), execute, report. Returns ExecutionReport or None."""
     print(_header("Screen 5: Execution"))
     mode_label = "DRY RUN" if dry_run else "LIVE"
     print(f"{BAR}  Mode: {mode_label}")
-    plan = build_execution_plan(card, asset, exchange, exchange_quotes, synth_options)
+    plan = build_execution_plan(
+        card, asset, exchange, exchange_quotes, synth_options,
+        quantity_override=quantity,
+        max_slippage_pct=max_slippage,
+        timeout_seconds=timeout,
+    )
     plan.dry_run = dry_run
     valid, err = validate_plan(plan)
     if not valid:
@@ -700,6 +708,12 @@ def screen_execution(
     print(f"{BAR}  Exchange: {plan.exchange.upper()}")
     print(f"{BAR}  Asset: {plan.asset}")
     print(f"{BAR}  Strategy: {plan.strategy_description}")
+    if max_slippage > 0:
+        print(f"{BAR}  Slippage Guard: max {max_slippage:.2f}%")
+    if timeout > 0:
+        print(f"{BAR}  Order Timeout: {timeout}s")
+    if quantity > 0:
+        print(f"{BAR}  Quantity Override: {quantity} contracts")
     print(f"{BAR}")
     print(_section("ORDER PLAN"))
     for order in plan.orders:
@@ -730,11 +744,20 @@ def screen_execution(
     for result in report.results:
         status_icon = "\u2713" if result.status in ("filled", "simulated") else "\u2717"
         err_suffix = f" [{result.error}]" if result.error else ""
+        slip_suffix = f" slip:{result.slippage_pct:+.2f}%" if result.slippage_pct else ""
+        latency_suffix = f" {result.latency_ms}ms" if result.latency_ms else ""
         print(f"{BAR}    {status_icon} {result.action} {result.instrument}: "
-              f"{result.status} @ ${result.fill_price:,.2f} x{result.fill_quantity}{err_suffix}")
+              f"{result.status} @ ${result.fill_price:,.2f} x{result.fill_quantity}"
+              f"{slip_suffix}{latency_suffix}{err_suffix}")
+    if report.cancelled_orders:
+        print(f"{BAR}")
+        print(f"{BAR}    Auto-cancelled: {', '.join(report.cancelled_orders)}")
     print(f"{BAR}")
     print(_kv("All Filled", "Yes" if report.all_filled else "No"))
     print(_kv("Net Cost", f"${report.net_cost:,.2f}"))
+    if report.started_at and report.finished_at:
+        print(_kv("Started", report.started_at))
+        print(_kv("Finished", report.finished_at))
     print(f"{BAR}  {report.summary}")
     print(_footer())
     return report
@@ -810,6 +833,12 @@ def main():
                         help="Allow execution when guardrail recommends no trade")
     parser.add_argument("--exchange", default=None, choices=["deribit", "aevo"],
                         help="Force exchange (default: auto-route per leg)")
+    parser.add_argument("--max-slippage", type=float, default=0.0, dest="max_slippage",
+                        help="Max allowed slippage %% (reject fill if exceeded, 0=off)")
+    parser.add_argument("--quantity", type=int, default=0,
+                        help="Override contract quantity for all legs (0=use strategy default)")
+    parser.add_argument("--timeout", type=int, default=0,
+                        help="Seconds to wait for order fill before cancelling (0=fire-and-forget)")
     args = parser.parse_args()
     screens = _parse_screen_arg(args.screen)
     with warnings.catch_warnings():
@@ -911,6 +940,9 @@ def main():
             card, symbol, args.exchange, exchange_quotes, options,
             dry_run=args.dry_run or not args.execute,
             no_prompt=args.no_prompt,
+            max_slippage=args.max_slippage,
+            quantity=args.quantity,
+            timeout=args.timeout,
         )
         shown_any = True
         if execution_report is None:
@@ -949,6 +981,12 @@ def main():
             "testnet": testnet,
             "all_filled": execution_report.all_filled,
             "net_cost": round(execution_report.net_cost, 2),
+            "started_at": execution_report.started_at,
+            "finished_at": execution_report.finished_at,
+            "max_slippage_pct": execution_report.plan.max_slippage_pct or None,
+            "timeout_seconds": execution_report.plan.timeout_seconds or None,
+            "quantity_override": execution_report.plan.quantity_override or None,
+            "cancelled_orders": execution_report.cancelled_orders or None,
             "fills": [
                 {
                     "instrument": r.instrument,
@@ -956,6 +994,9 @@ def main():
                     "status": r.status,
                     "fill_price": round(r.fill_price, 2),
                     "fill_quantity": r.fill_quantity,
+                    "slippage_pct": round(r.slippage_pct, 4) if r.slippage_pct else None,
+                    "latency_ms": r.latency_ms or None,
+                    "timestamp": r.timestamp or None,
                 }
                 for r in execution_report.results
             ],
