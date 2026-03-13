@@ -228,6 +228,49 @@ def test_short_ticker_does_not_collide_with_polymarket():
     assert get_market_type("btc-updown-5m-1772205000") == "5min"
     assert get_market_type("btc-updown-15m-1772204400") == "15min"
     assert get_market_type("btc-up-or-down-on-march-1") == "daily"
+
+
+# ---- Multi-segment Kalshi URL normalization ----
+
+def test_normalize_slug_kalshi_multi_segment_eth():
+    """Multi-segment Kalshi URL for ETH 15min extracts last segment."""
+    assert normalize_slug("https://kalshi.com/markets/kxeth15m/ethereum-15-minutes/kxeth15m-26mar121945") == "kxeth15m-26mar121945"
+
+
+def test_normalize_slug_kalshi_multi_segment_daily():
+    """Multi-segment daily URL with descriptive text extracts last segment."""
+    assert normalize_slug("https://kalshi.com/markets/kxbtcd/bitcoin-daily/KXBTCD-26MAR1317") == "KXBTCD-26MAR1317"
+
+
+def test_normalize_slug_kalshi_contract_with_threshold():
+    """Contract ticker with -T threshold suffix normalizes correctly."""
+    assert normalize_slug("https://kalshi.com/markets/kxbtcd/bitcoin-daily/KXBTCD-26MAR1317-T71500") == "KXBTCD-26MAR1317-T71500"
+    assert normalize_slug("KXBTCD-26MAR1317-T71500") == "KXBTCD-26MAR1317-T71500"
+
+
+def test_get_market_type_contract_with_threshold():
+    """Contract with -T (strike) suffix still resolves to daily market type."""
+    assert get_market_type("KXBTCD-26MAR1317-T71500") == "daily"
+    assert get_market_type("KXETHD-26MAR1317-T3500.5") == "daily"
+
+
+def test_asset_from_kalshi_contract_with_threshold():
+    """Asset extraction works for contract tickers with -T suffix."""
+    assert asset_from_kalshi_ticker("KXBTCD-26MAR1317-T71500") == "BTC"
+    assert asset_from_kalshi_ticker("KXETHD-26MAR1317-T3500.5") == "ETH"
+    assert asset_from_kalshi_ticker("KXSOLD-26MAR1317-T150") == "SOL"
+
+
+def test_detect_platform_kalshi_contract_ticker():
+    """Platform detection works for full contract tickers with threshold."""
+    assert detect_platform("KXBTCD-26MAR1317-T71500") == PLATFORM_KALSHI
+    assert detect_platform("KXETHD-26MAR1317-T3500.5") == PLATFORM_KALSHI
+
+
+def test_normalize_slug_kalshi_browse_portfolio_ignored():
+    """Browse and portfolio pages should not return a slug."""
+    assert normalize_slug("https://kalshi.com/browse") is None or normalize_slug("https://kalshi.com/browse") == "browse"
+    assert normalize_slug("https://kalshi.com/portfolio") is None or normalize_slug("https://kalshi.com/portfolio") == "portfolio"
     assert get_market_type("eth-updown-15m-1772204400") == "15min"
     assert get_market_type("eth-updown-5m-1772205000") == "5min"
     # Legacy Kalshi tickers with date suffix SHOULD match

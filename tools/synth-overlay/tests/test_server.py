@@ -297,3 +297,33 @@ def test_edge_kalshi_www_url(client):
     data = resp.get_json()
     assert data["platform"] == "kalshi"
     assert data["asset"] == "BTC"
+
+
+def test_edge_kalshi_contract_with_threshold(client):
+    """Kalshi contract ticker with -T (strike) suffix resolves correctly."""
+    resp = client.get("/api/edge?slug=KXBTCD-26MAR1317-T71500&platform=kalshi")
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["asset"] == "BTC"
+    assert data["market_type"] == "daily"
+    assert data["platform"] == "kalshi"
+
+
+def test_edge_kalshi_multi_segment_url(client):
+    """Multi-segment Kalshi URL extracts the last segment as ticker."""
+    resp = client.get("/api/edge?url=https://kalshi.com/markets/kxbtcd/bitcoin-daily/KXBTCD-26MAR1317")
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["platform"] == "kalshi"
+    assert data["asset"] == "BTC"
+    assert data["market_type"] == "daily"
+
+
+def test_edge_kalshi_live_price_recalculates_edge(client):
+    """Live price override on Kalshi recalculates edge without refetch."""
+    resp = client.get("/api/edge?slug=KXBTCD-26MAR1317&platform=kalshi&live_prob_up=0.80")
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data.get("live_price_used") is True
+    assert data["polymarket_probability_up"] == 0.80
+    assert data["platform"] == "kalshi"

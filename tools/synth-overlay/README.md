@@ -16,6 +16,8 @@ Chrome extension that uses Chrome's **native Side Panel** to show Synth market c
 ## How it works
 
 1. **Content script** (on `polymarket.com` and `kalshi.com`) reads the market slug from the page URL and scrapes **live prices** and **balance** from the DOM. Platform detection is automatic. The content script guards all `chrome.runtime` calls against extension context invalidation (e.g. after extension reload) — when the context becomes invalid, the observer, polling interval, and message listeners stop gracefully.
+   - **Kalshi multi-strike scraping**: On multi-strike pages (e.g. daily above/below with multiple price thresholds), the DOM contains prices for every strike in a list. The scraper uses a **two-pass approach**: Pass 1 scans only elements inside the **trading panel** (detected by walking up ancestors for a container with "Buy"/"Sell"/"Amount" text — the order form for the selected contract). Pass 2 falls back to general DOM scanning if no trading panel is found (e.g. single-strike pages). This ensures the displayed price always matches the user's **selected** contract, not the first strike in the list.
+   - A `MutationObserver` detects DOM changes (e.g. user clicking a different strike) and broadcasts updated prices to the side panel via `chrome.runtime.sendMessage`. The side panel recalculates edge client-side using `updateWithLivePrice()` without re-fetching from the server.
 2. **Side panel page** requests context from the content script and fetches Synth edge data from local API (`GET /api/edge?slug=...&platform=...`).
 3. **Panel rendering** displays Synth forecast data (prices, edge, signal, confidence, analysis, invalidation) and updates every 15s or on manual refresh. Column headers adapt to show "Poly" or "Kalshi" based on the active platform.
 4. **Position Sizing card** combines Synth probabilities, market-implied odds, forecast confidence, and user balance into a Kelly-based recommendation.
@@ -49,6 +51,16 @@ The matcher extracts the asset from the series prefix (e.g. `KXBTCD` → BTC) an
 - Series ending in `15M` (KXBTC15M, KXETH15M) → 15-minute
 
 Kalshi URLs can have multiple path segments (e.g. `/markets/kxsol15m/solana-15-minutes/kxsol15m-26mar121945`); both `normalize_slug` and the content script extract the **last segment** as the ticker.
+
+### Kalshi price scraping
+
+The content script (`content.js`) uses a multi-strategy approach to scrape live Yes/No prices from Kalshi's DOM:
+
+1. **`extractPrice(text, side)`** — helper that matches cent format (`Yes 80¢`, `Buy Yes 80¢`) and dollar format (`Yes $0.80`, `Buy Yes $0.80`).
+2. **`isInTradingPanel(el)`** — walks up the DOM tree (up to 8 ancestors) looking for a container whose text includes "Buy", "Sell", and "Amount" (the order form). Also matches "sign up to trade" for logged-out users.
+3. **Pass 1 (trading panel priority)** — scans `button, a, span, div, p, [role='button'], [role='cell'], td` elements, but only accepts prices from elements inside the trading panel. This ensures the selected contract's price is used on multi-strike pages.
+4. **Pass 2 (fallback)** — if Pass 1 finds no valid pair, rescans all elements without the trading panel constraint. Includes standalone price leaf-walk (parent context) and order book pattern matching.
+5. **Inference** — if only one side (Yes or No) is found, the other is inferred as `1 - found`.
 
 ## Synth API usage
 

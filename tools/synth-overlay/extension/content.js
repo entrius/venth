@@ -224,53 +224,98 @@
    * - Dollar format: "$0.52" or "0.52" near Yes/No context
    * - Cent format: "52¢" near Yes/No context
    * - Order book displays with bid/ask in dollars
+   *
+   * On multi-strike pages (e.g. daily above/below with $71,250, $71,500, $71,750),
+   * the DOM has prices for ALL strikes in a list, but the active/selected contract's
+   * prices appear in the trading panel (near Buy/Sell/Amount controls).
+   * We prioritize the trading panel prices.
    */
   function scrapeKalshiPrices() {
     var yesPrice = null;
     var noPrice = null;
 
+    // Helper: check if an element is inside the trading panel
+    // (ancestor contains "buy" and "sell" and "amount" — the order form)
+    function isInTradingPanel(el) {
+      var ancestor = el.parentElement;
+      for (var up = 0; up < 8 && ancestor; up++) {
+        var aText = (ancestor.textContent || "").toLowerCase();
+        // Trading panel containers are typically < 500 chars and contain Buy+Sell+Amount
+        if (aText.length < 500 && /\bbuy\b/.test(aText) && /\bsell\b/.test(aText) && /\bamount\b/.test(aText)) {
+          return true;
+        }
+        // Also match panels with "sign up to trade" for logged-out users
+        if (aText.length < 500 && /\bbuy\b/.test(aText) && /sign up/i.test(aText)) {
+          return true;
+        }
+        ancestor = ancestor.parentElement;
+      }
+      return false;
+    }
+
+    // Helper: extract Yes/No cent or dollar price from text
+    function extractPrice(text, side) {
+      // side = "yes" or "no", matches Yes/Up or No/Down
+      var sidePattern = side === "yes" ? "(yes|up)" : "(no|down)";
+      // Cent format: "Yes 80¢" / "Buy Yes 80¢"
+      var cm = text.match(new RegExp("(?:buy\\s+)?" + sidePattern + "\\s+(\\d{1,2})\\s*[¢c%]", "i"));
+      if (cm) {
+        var cv = parseInt(cm[2], 10) / 100;
+        if (cv >= 0.01 && cv <= 0.99) return cv;
+      }
+      // Dollar format: "Yes $0.80" / "Buy Yes $0.80"
+      var dm = text.match(new RegExp("(?:buy\\s+)?" + sidePattern + "\\s+\\$?(0\\.\\d{2,4})", "i"));
+      if (dm) {
+        var dv = parseFloat(dm[2]);
+        if (dv >= 0.01 && dv <= 0.99) return dv;
+      }
+      return null;
+    }
+
     var els = document.querySelectorAll("button, a, span, div, p, [role='button'], [role='cell'], td");
+
+    // Pass 1: PRIORITY — scan only elements inside the trading panel
+    // (the Buy/Sell/Amount card with the active contract's prices)
     for (var i = 0; i < els.length; i++) {
       var text = (els[i].textContent || "").trim();
       if (text.length > 40 || text.length < 2) continue;
-
-      // Strategy 1: "Yes XX¢" / "No XX¢" or "Buy Yes XX¢" / "Buy No XX¢" (cent format)
       if (yesPrice === null) {
-        var ym = text.match(/(?:buy\s+)?(yes|up)\s+(\d{1,2})\s*[¢c%]/i);
-        if (ym) {
-          var yp = parseInt(ym[2], 10) / 100;
-          if (yp >= 0.01 && yp <= 0.99) yesPrice = yp;
-        }
+        var yp = extractPrice(text, "yes");
+        if (yp !== null && isInTradingPanel(els[i])) yesPrice = yp;
       }
       if (noPrice === null) {
-        var nm = text.match(/(?:buy\s+)?(no|down)\s+(\d{1,2})\s*[¢c%]/i);
-        if (nm) {
-          var np = parseInt(nm[2], 10) / 100;
-          if (np >= 0.01 && np <= 0.99) noPrice = np;
-        }
+        var np = extractPrice(text, "no");
+        if (np !== null && isInTradingPanel(els[i])) noPrice = np;
       }
+      if (yesPrice !== null && noPrice !== null) break;
+    }
 
-      // Strategy 2: Dollar format — "Yes $0.52" / "No $0.48" or "Buy Yes $0.52"
+    if (yesPrice !== null && noPrice !== null && validatePricePair(yesPrice, noPrice)) {
+      console.log("[Synth-Overlay] Kalshi prices from trading panel:", { upPrice: yesPrice, downPrice: noPrice });
+      return { upPrice: yesPrice, downPrice: noPrice };
+    }
+
+    // Pass 2: FALLBACK — scan all elements (single-strike pages, or panel not found)
+    yesPrice = null;
+    noPrice = null;
+    for (var j = 0; j < els.length; j++) {
+      var text2 = (els[j].textContent || "").trim();
+      if (text2.length > 40 || text2.length < 2) continue;
+
+      // Strategy 1: "Yes XX¢" / "No XX¢" (cent format)
       if (yesPrice === null) {
-        var ydm = text.match(/(?:buy\s+)?(yes|up)\s+\$?(0\.\d{2,4})/i);
-        if (ydm) {
-          var ydp = parseFloat(ydm[2]);
-          if (ydp >= 0.01 && ydp <= 0.99) yesPrice = ydp;
-        }
+        var yv = extractPrice(text2, "yes");
+        if (yv !== null) yesPrice = yv;
       }
       if (noPrice === null) {
-        var ndm = text.match(/(?:buy\s+)?(no|down)\s+\$?(0\.\d{2,4})/i);
-        if (ndm) {
-          var ndp = parseFloat(ndm[2]);
-          if (ndp >= 0.01 && ndp <= 0.99) noPrice = ndp;
-        }
+        var nv = extractPrice(text2, "no");
+        if (nv !== null) noPrice = nv;
       }
 
-      // Strategy 3: Standalone price near Yes/No context in parent
-      // Matches: "52¢", "$0.52", "0.52"
+      // Strategy 2: Standalone price near Yes/No context in parent
       if (yesPrice === null || noPrice === null) {
-        var pm = text.match(/^(\d{1,2})\s*[¢c%]$/) ||
-                 text.match(/^\$?(0\.\d{2,4})$/);
+        var pm = text2.match(/^(\d{1,2})\s*[¢c%]$/) ||
+                 text2.match(/^\$?(0\.\d{2,4})$/);
         if (pm) {
           var rawVal = pm[1];
           var price;
@@ -280,7 +325,7 @@
             price = parseInt(rawVal, 10) / 100;
           }
           if (price >= 0.01 && price <= 0.99) {
-            var parent = els[i].parentElement;
+            var parent = els[j].parentElement;
             for (var d = 0; d < 5 && parent; d++) {
               var pText = (parent.textContent || "").toLowerCase();
               if (pText.length > 120) break;
@@ -295,8 +340,7 @@
       if (yesPrice !== null && noPrice !== null) break;
     }
 
-    // Strategy 4: Look for Kalshi's order book / price display patterns
-    // E.g. "Best Yes: $0.52" / "Best No: $0.48" or "Last: $0.52"
+    // Strategy 3: Look for Kalshi's order book / price display patterns
     if (yesPrice === null || noPrice === null) {
       for (var k = 0; k < els.length; k++) {
         var t = (els[k].textContent || "").trim();
@@ -431,12 +475,17 @@
   // Broadcast price update to extension
   function broadcastPriceUpdate(prices) {
     if (!prices || !isContextValid()) return;
-    chrome.runtime.sendMessage({
-      type: "synth:priceUpdate",
-      prices: prices,
-      slug: slugFromPage(),
-      timestamp: Date.now()
-    }).catch(function() {});
+    try {
+      chrome.runtime.sendMessage({
+        type: "synth:priceUpdate",
+        prices: prices,
+        slug: slugFromPage(),
+        timestamp: Date.now()
+      }).catch(function() {});
+    } catch (e) {
+      _contextValid = false;
+      teardown();
+    }
   }
 
   // Check if prices changed and broadcast if so
@@ -481,12 +530,18 @@
       console.log("[Synth-Overlay] URL changed:", lastSlug, "->", newSlug);
       lastSlug = newSlug;
       lastPrices = { upPrice: null, downPrice: null };
-      chrome.runtime.sendMessage({
-        type: "synth:urlChanged",
-        slug: newSlug,
-        url: window.location.href,
-        timestamp: Date.now()
-      }).catch(function() {});
+      try {
+        chrome.runtime.sendMessage({
+          type: "synth:urlChanged",
+          slug: newSlug,
+          url: window.location.href,
+          timestamp: Date.now()
+        }).catch(function() {});
+      } catch (e) {
+        _contextValid = false;
+        teardown();
+        return;
+      }
       // Immediately scrape and broadcast new prices
       setTimeout(checkAndBroadcastPrices, 200);
     }
