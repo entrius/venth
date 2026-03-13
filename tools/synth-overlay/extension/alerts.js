@@ -7,7 +7,7 @@
  * Storage keys (chrome.storage.local):
  *   synth_alerts_enabled      : boolean
  *   synth_alerts_threshold    : number  (edge pp, default 3.0)
- *   synth_alerts_watchlist    : Array<{ slug, asset, label, addedAt }>
+ *   synth_alerts_watchlist    : Array<{ slug, asset, label, platform, addedAt }>
  *   synth_alerts_cooldowns    : Object  { slug: timestamp }
  *   synth_alerts_history      : Array<{ slug, label, title, message, edgePct, signal, timestamp }>
  *   synth_alerts_auto_dismiss : boolean  (default false)
@@ -72,8 +72,10 @@ var SynthAlerts = (function () {
 
   // ---- Watchlist ----
 
-  function addToWatchlist(slug, asset, label, callback) {
+  function addToWatchlist(slug, asset, label, platform, callback) {
     if (!slug) { if (callback) callback([]); return; }
+    // Backward compat: if platform is a function, it's the old callback signature
+    if (typeof platform === "function") { callback = platform; platform = "polymarket"; }
     load(function (settings) {
       var exists = settings.watchlist.some(function (w) { return w.slug === slug; });
       if (exists) { if (callback) callback(settings.watchlist); return; }
@@ -82,6 +84,7 @@ var SynthAlerts = (function () {
         slug: slug,
         asset: asset || "BTC",
         label: label || slug,
+        platform: platform || "polymarket",
         addedAt: Date.now(),
       });
       saveWatchlist(settings.watchlist);
@@ -180,9 +183,14 @@ var SynthAlerts = (function () {
 
   // ---- Format ----
 
-  function formatMarketLabel(asset, marketType) {
+  function formatMarketLabel(asset, marketType, platform) {
     var typeMap = { daily: "24h", hourly: "1h", "15min": "15m", "5min": "5m" };
-    return (asset || "BTC") + " " + (typeMap[marketType] || marketType || "daily");
+    var prefix = "";
+    if (platform && platform !== "polymarket" && typeof SynthPlatforms !== "undefined") {
+      var p = SynthPlatforms.get(platform);
+      if (p) prefix = p.label + " ";
+    }
+    return prefix + (asset || "BTC") + " " + (typeMap[marketType] || marketType || "daily");
   }
 
   return {

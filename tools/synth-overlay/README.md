@@ -1,6 +1,6 @@
-# Synth Overlay — Polymarket Edge & Position Sizing Extension
+# Synth Overlay — Polymarket & Kalshi Edge Extension
 
-Chrome extension that uses Chrome's **native Side Panel** to show Synth market context on Polymarket and convert that edge into a **concrete position size**. The panel is data-first: Synth Up/Down prices, edge, confidence, signal explanation, invalidation conditions, and a **Kelly-based position sizing calculator**.
+Chrome extension that uses Chrome's **native Side Panel** to show Synth market context on **Polymarket** and **Kalshi** and convert that edge into a **concrete position size**. The panel is data-first: Synth Up/Down prices, edge, confidence, signal explanation, invalidation conditions, and a **Kelly-based position sizing calculator**.
 
 ## What it does
 
@@ -10,16 +10,25 @@ Chrome extension that uses Chrome's **native Side Panel** to show Synth market c
 - **Synth-sourced prices only**: Displays prices from the Synth API to avoid sync issues with DOM-scraped market data.
 - **Manual + auto refresh**: Refresh button in panel plus automatic 15s refresh. "Data as of" timestamp shows when the Synth data was generated.
 - **Clear confidence colors**: red (&lt;40%), amber (40–70%), green (≥70%).
-- **Contextual only**: Enabled on Polymarket pages; panel shows guidance when page/slug is unsupported.
+- **Multi-platform**: Works on both Polymarket and Kalshi. Platform is auto-detected from URL; the UI dynamically shows "Poly" or "Kalshi" labels.
+- **Contextual only**: Enabled on supported platform pages; panel shows guidance when page/slug is unsupported.
+
+## Architecture
+
+The codebase uses a **platform registry pattern** — each platform (Polymarket, Kalshi) is a self-contained module with its own URL patterns, asset maps, slug normalisation, and market-type detection. Adding a third platform means adding one entry to the registry; no if/else scattering across the codebase.
+
+- **`matcher.py`** — Platform registry (Python, server-side). Polymarket checked first to prevent slug collisions with Kalshi legacy tickers.
+- **`extension/platforms.js`** — Platform registry (JS, extension-side). Single source of truth for origins, domain hints, URL templates.
+- **`extension/content.js`** — Strategy pattern: platform detected once at init, scrapers dispatched per platform.
 
 ## How it works
 
-1. **Content script** (on `polymarket.com`) reads the market slug from the page URL and scrapes **live prices** and **balance** from the DOM.
-2. **Side panel page** requests context from the content script and fetches Synth edge data from local API (`GET /api/edge?slug=...`).
-3. **Panel rendering** displays Synth forecast data (prices, edge, signal, confidence, analysis, invalidation) and updates every 15s or on manual refresh.
-4. **Position Sizing card** combines Synth probabilities, Polymarket-implied odds, forecast confidence, and user balance into a Kelly-based recommendation.
-5. **Background service worker** enables/disables side panel per-tab based on URL and runs the alert polling engine.
-6. **Edge alerts** poll watched markets every 60s via `chrome.alarms`. When edge exceeds the user's threshold, a browser notification fires with asset, edge size, signal direction, and confidence. Clicking the notification focuses or opens the relevant Polymarket page. Notifications are suppressed when the user is already viewing the market and have a 5-minute cooldown per market to avoid spam.
+1. **Content script** (on `polymarket.com` and `kalshi.com`) detects platform from hostname, reads the market slug using platform-specific extraction, and scrapes **live prices** and **balance** from the DOM.
+2. **Side panel page** requests context from the content script and fetches Synth edge data from local API (`GET /api/edge?slug=...&platform=...`).
+3. **Panel rendering** displays Synth forecast data (prices, edge, signal, confidence, analysis, invalidation) with dynamic platform labels and updates every 30s or on manual refresh.
+4. **Position Sizing card** combines Synth probabilities, market-implied odds, forecast confidence, and user balance into a Kelly-based recommendation.
+5. **Background service worker** enables/disables side panel per-tab based on URL (any supported platform) and runs the alert polling engine.
+6. **Edge alerts** poll watched markets every 60s via `chrome.alarms`. Each watchlist entry stores its platform. When edge exceeds the user's threshold, a browser notification fires with asset, edge size, signal direction, and confidence. Clicking the notification focuses or opens the relevant market page on the correct platform. Notifications are suppressed when the user is already viewing the market and have a 5-minute cooldown per market to avoid spam.
 
 ## Synth API usage
 
@@ -37,7 +46,7 @@ The **Position Sizing** card in the side panel answers “how much should I bet?
 ### Balance detection
 
 - The content script (`content.js`) runs on `polymarket.com` and:
-  - Scrapes **wallet / account balance** from compact DOM text such as `Balance 123.45 USDC` or `$123.45`.
+  - Scrapes **wallet / account balance** from compact DOM text such as `Balance 123.45 USDC` or `$123.45` (works on both Polymarket and Kalshi).
   - Exposes this numeric balance as `balance` in the context returned to the side panel.
 - In the side panel (`sidepanel.html` / `sidepanel.js`):
   - The **Balance** field is pre-filled with the scraped value when available.
@@ -113,9 +122,9 @@ The UI shows:
 ## Run locally
 
 1. Install: `pip install -r requirements.txt` (from repo root: `pip install -r tools/synth-overlay/requirements.txt`).
-2. Start server (from repo root): `python tools/synth-overlay/server.py` (or from `tools/synth-overlay`: `python server.py`). Listens on `127.0.0.1:8765`.
+2. Start server (from repo root): `python tools/synth-overlay/server.py` (or from `tools/synth-overlay`: `python server.py`). Listens on `127.0.0.1:8765`. Set `SERVER_HOST` env var to change bind address.
 3. Load extension: Chrome → Extensions → Load unpacked → select `tools/synth-overlay/extension`.
-4. Click the extension icon to open **Chrome Side Panel** (or pin and open from Side Panel UI). On Polymarket pages, the panel auto-enables.
+4. Click the extension icon to open **Chrome Side Panel** (or pin and open from Side Panel UI). On Polymarket or Kalshi pages, the panel auto-enables.
 
 ## Verify the side panel (before recording)
 
@@ -126,9 +135,11 @@ The UI shows:
    You should see JSON with `"signal"`, `"edge_pct"`, etc. If you see `"error"` or 404, the slug is not supported for the current mock/API.
 
 2. **Open the exact URL** in Chrome (with the extension loaded from `extension/`):
-   - Daily (BTC): `https://polymarket.com/event/bitcoin-up-or-down-on-february-26`
-   - Hourly (ETH): `https://polymarket.com/event/ethereum-up-or-down-february-25-6pm-et`
-   - 15-Min (SOL): `https://polymarket.com/event/sol-updown-15m-1772204400`
+   - **Polymarket** Daily (BTC): `https://polymarket.com/event/bitcoin-up-or-down-on-february-26`
+   - **Polymarket** Hourly (ETH): `https://polymarket.com/event/ethereum-up-or-down-february-25-6pm-et`
+   - **Polymarket** 15-Min (SOL): `https://polymarket.com/event/sol-updown-15m-1772204400`
+   - **Kalshi** Daily (BTC): `https://kalshi.com/markets/kxbtcd`
+   - **Kalshi** Range (BTC): `https://kalshi.com/markets/kxbtc`
    - The side panel requests the slug from the page and fetches Synth data from the local API. If API returns 200, panel fields populate.
 
 3. **Interaction:**

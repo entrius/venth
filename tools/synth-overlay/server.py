@@ -1,6 +1,6 @@
 """
 Local API server for the Synth Overlay extension.
-Serves edge data from SynthClient; extension calls this from Polymarket pages.
+Serves edge data from SynthClient; extension calls this from Polymarket and Kalshi pages.
 """
 
 import os
@@ -17,7 +17,21 @@ from synth_client import SynthClient
 
 from analyzer import EdgeAnalyzer
 from edge import edge_from_range_bracket, signal_from_edge
-from matcher import asset_from_slug, get_market_type, normalize_slug
+from matcher import (
+    asset_from_kalshi_ticker,
+    asset_from_slug,
+    detect_platform,
+    get_market_type,
+    normalize_slug,
+    resolve,
+    registry,
+    ERR_INVALID_INPUT,
+    ERR_NORMALIZE_FAILED,
+    ERR_UNKNOWN_PLATFORM,
+    ERR_UNSUPPORTED_MARKET,
+    PLATFORM_KALSHI,
+    PLATFORM_POLYMARKET,
+)
 
 app = Flask(__name__)
 _client: SynthClient | None = None
@@ -94,13 +108,15 @@ def _fetch_updown_pair(client: SynthClient, asset: str, market_type: str) -> tup
 
 
 def _handle_updown_market(
-    client: SynthClient, slug: str, asset: str, market_type: str, live_prob_up: float | None = None
+    client: SynthClient, slug: str, asset: str, market_type: str,
+    live_prob_up: float | None = None, platform: str = "polymarket",
 ):
     """Handle up/down markets for any supported asset and horizon.
-    
+
     Args:
-        live_prob_up: Real-time Polymarket price scraped from DOM. If provided,
+        live_prob_up: Real-time market price scraped from DOM. If provided,
                       overrides the API's polymarket_probability_up for edge calculation.
+        platform: Source platform ("polymarket" or "kalshi").
     """
     primary_data, reference_data = _fetch_updown_pair(client, asset, market_type)
 
@@ -132,6 +148,7 @@ def _handle_updown_market(
             "asset": asset,
             "horizon": primary_horizon,
             "market_type": market_type,
+            "platform": platform,
             "edge_pct": result.primary.edge_pct,
             "signal": result.primary.signal,
             "strength": result.strength,
@@ -159,6 +176,7 @@ def _handle_updown_market(
         "asset": asset,
         "horizon": primary_horizon,
         "market_type": market_type,
+        "platform": platform,
         "edge_pct": result.primary.edge_pct,
         "signal": result.primary.signal,
         "strength": result.strength,
@@ -182,19 +200,38 @@ def _handle_updown_market(
     return jsonify(resp)
 
 
+@app.route("/api/platforms", methods=["GET", "OPTIONS"])
+def platforms():
+    """Introspection: list registered platforms, supported assets, market types."""
+    if request.method == "OPTIONS":
+        return "", 204
+    return jsonify({
+        "platforms": registry.capabilities(),
+        "all_supported_assets": sorted(registry.all_supported_assets()),
+    })
+
+
 @app.route("/api/edge", methods=["GET", "OPTIONS"])
 def edge():
     if request.method == "OPTIONS":
         return "", 204
     raw = request.args.get("slug") or request.args.get("url") or ""
-    slug = normalize_slug(raw)
-    if not slug:
-        return jsonify({"error": "Missing or invalid slug/url"}), 400
-    market_type = get_market_type(slug)
-    if not market_type:
-        return jsonify({"error": "Unsupported market", "slug": slug}), 404
-    asset = asset_from_slug(slug) or "BTC"
-    # Live Polymarket price scraped from DOM (real-time, avoids API latency)
+    platform_hint = request.args.get("platform")
+    # Structured resolve: slug + asset + market_type + platform + diagnostics
+    result = registry.resolve(raw, platform_hint)
+    if not result.ok:
+        code = result.error_code
+        if code == ERR_INVALID_INPUT or code == ERR_NORMALIZE_FAILED:
+            return jsonify({"error": result.error, "error_code": code}), 400
+        if code == ERR_UNKNOWN_PLATFORM:
+            return jsonify({"error": result.error, "error_code": code, "slug": result.slug}), 400
+        # ERR_UNSUPPORTED_MARKET or anything else → 404
+        return jsonify({"error": result.error or "Unsupported market", "error_code": code, "slug": result.slug}), 404
+    slug = result.slug
+    asset = result.asset
+    market_type = result.market_type
+    platform = result.platform
+    # Live market price scraped from DOM (real-time, avoids API latency)
     live_prob_up = request.args.get("live_prob_up")
     if live_prob_up:
         try:
@@ -204,8 +241,11 @@ def edge():
     try:
         client = get_client()
         if market_type in ("daily", "hourly", "15min", "5min"):
-            return _handle_updown_market(client, slug, asset, market_type, live_prob_up)
-        # range
+            return _handle_updown_market(client, slug, asset, market_type, live_prob_up, platform)
+        # Kalshi "range" contracts are binary Yes/No — route through up/down handler
+        if market_type == "range" and platform == PLATFORM_KALSHI:
+            return _handle_updown_market(client, slug, asset, "daily", live_prob_up, platform)
+        # Polymarket range (multi-bracket)
         data = client.get_polymarket_range()
         if not isinstance(data, list):
             return jsonify({"error": "Invalid range data"}), 500
@@ -246,6 +286,7 @@ def edge():
         return jsonify({
             "slug": selected.get("slug"),
             "horizon": "24h",
+            "platform": platform,
             "bracket_title": selected.get("title"),
             "edge_pct": result.primary.edge_pct,
             "signal": result.primary.signal,
@@ -268,7 +309,8 @@ def edge():
 def main():
     import warnings
     warnings.filterwarnings("ignore", message="No SYNTH_API_KEY")
-    app.run(host="127.0.0.1", port=8765, debug=False, use_reloader=False)
+    host = os.environ.get("SERVER_HOST", "127.0.0.1")
+    app.run(host=host, port=8765, debug=False, use_reloader=False)
 
 
 if __name__ == "__main__":

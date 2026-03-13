@@ -1,6 +1,8 @@
-var SUPPORTED_ORIGINS = [
-  "https://polymarket.com/"
-];
+// ---- Platform-aware background service worker ----
+// Uses SynthPlatforms (loaded via importScripts) as single source of truth
+// for supported origins and market URLs.
+
+try { importScripts("platforms.js"); } catch (_e) {}
 
 var API_BASE = "http://127.0.0.1:8765";
 var ALARM_NAME = "synth-alert-poll";
@@ -20,10 +22,8 @@ var STORE_KEYS = {
 var COOLDOWN_MS = 5 * 60 * 1000;
 
 function isSupportedUrl(url) {
-  for (var i = 0; i < SUPPORTED_ORIGINS.length; i++) {
-    if (url.indexOf(SUPPORTED_ORIGINS[i]) === 0) return true;
-  }
-  return false;
+  if (typeof SynthPlatforms !== "undefined") return SynthPlatforms.isSupportedUrl(url);
+  return url && url.indexOf("polymarket.com") !== -1;
 }
 
 // ---- Side Panel ----
@@ -47,8 +47,7 @@ chrome.tabs.onUpdated.addListener(function (tabId, info, tab) {
   }
 });
 
-// Poll immediately when user switches away from a Polymarket tab.
-// If tab.url is unavailable (e.g. chrome:// pages), assume non-Polymarket.
+// Poll immediately when user switches away from a supported tab.
 chrome.tabs.onActivated.addListener(function (activeInfo) {
   chrome.tabs.get(activeInfo.tabId, function (tab) {
     if (chrome.runtime.lastError || !tab) { pollWatchlist(); return; }
@@ -143,7 +142,9 @@ function pollWatchlist() {
 }
 
 function checkMarketEdge(item, threshold) {
-  var url = API_BASE + "/api/edge?slug=" + encodeURIComponent(item.slug);
+  var platform = item.platform || "polymarket";
+  var url = API_BASE + "/api/edge?slug=" + encodeURIComponent(item.slug)
+    + "&platform=" + encodeURIComponent(platform);
   fetch(url)
     .then(function (res) {
       if (!res.ok) throw new Error("HTTP " + res.status);
@@ -170,7 +171,7 @@ function suppressAndNotify(item, data, cooldowns) {
 
     chrome.tabs.query({ active: true, lastFocusedWindow: true }, function (tabs) {
       var activeUrl = (tabs && tabs[0] && tabs[0].url) || "";
-      if (activeUrl.indexOf("polymarket.com") !== -1 && activeUrl.indexOf(item.slug) !== -1) {
+      if (isSupportedUrl(activeUrl) && activeUrl.indexOf(item.slug) !== -1) {
         return;
       }
       cooldowns[item.slug] = Date.now();
@@ -196,12 +197,15 @@ function createEdgeNotification(notifId, item, data) {
   var conf = data.confidence_score != null ? Math.round(data.confidence_score * 100) + "%" : "—";
   var confLabel = data.confidence_score >= 0.7 ? "High" : data.confidence_score >= 0.4 ? "Med" : "Low";
 
+  var platform = item.platform || "polymarket";
+  var platformLabel = (typeof SynthPlatforms !== "undefined" && SynthPlatforms.get(platform))
+    ? SynthPlatforms.get(platform).label : "Poly";
   var synthUp = fmtProb(data.synth_probability_up != null ? data.synth_probability_up : data.synth_probability);
   var polyUp = fmtProb(data.polymarket_probability_up != null ? data.polymarket_probability_up : data.polymarket_probability);
 
   var title = (item.label || item.slug) + " — " + direction + " " + sign + edge + "pp";
   var lines = [
-    "Synth " + synthUp + " vs Poly " + polyUp + " | " + strength,
+    "Synth " + synthUp + " vs " + platformLabel + " " + polyUp + " | " + strength,
     "Confidence: " + confLabel + " (" + conf + ")",
   ];
   if (data.explanation) {
@@ -211,6 +215,7 @@ function createEdgeNotification(notifId, item, data) {
   // Save to notification history
   var historyEntry = {
     slug: item.slug,
+    platform: platform,
     label: item.label || item.slug,
     title: title,
     message: lines.join("\n"),
@@ -242,29 +247,42 @@ function createEdgeNotification(notifId, item, data) {
   });
 }
 
-// Focus or open the Polymarket page for the clicked notification
+// Focus or open the correct market page for the clicked notification.
+// Uses stored platform from watchlist to build the right URL.
 chrome.notifications.onClicked.addListener(function (notifId) {
   if (notifId.indexOf("synth-edge::") !== 0) return;
   var slug = notifId.replace("synth-edge::", "");
   if (!slug) { chrome.notifications.clear(notifId); return; }
 
-  var targetUrl = "https://polymarket.com/event/" + slug;
+  // Look up the watchlist to get the platform for this slug
+  chrome.storage.local.get([STORE_KEYS.watchlist], function (result) {
+    var watchlist = Array.isArray(result[STORE_KEYS.watchlist]) ? result[STORE_KEYS.watchlist] : [];
+    var item = null;
+    for (var i = 0; i < watchlist.length; i++) {
+      if (watchlist[i].slug === slug) { item = watchlist[i]; break; }
+    }
+    var platform = (item && item.platform) || "polymarket";
+    var targetUrl = (typeof SynthPlatforms !== "undefined")
+      ? SynthPlatforms.marketUrl(platform, slug)
+      : "https://polymarket.com/event/" + slug;
 
-  chrome.tabs.query({ url: "https://polymarket.com/*" }, function (tabs) {
-    var match = null;
-    for (var i = 0; i < tabs.length; i++) {
-      if (tabs[i].url && tabs[i].url.indexOf(slug) !== -1) {
-        match = tabs[i];
-        break;
+    // Search across all supported platform tabs
+    chrome.tabs.query({}, function (tabs) {
+      var match = null;
+      for (var j = 0; j < tabs.length; j++) {
+        if (tabs[j].url && isSupportedUrl(tabs[j].url) && tabs[j].url.indexOf(slug) !== -1) {
+          match = tabs[j];
+          break;
+        }
       }
-    }
-    if (match) {
-      chrome.tabs.update(match.id, { active: true });
-      chrome.windows.update(match.windowId, { focused: true });
-    } else {
-      chrome.tabs.create({ url: targetUrl });
-    }
-    chrome.notifications.clear(notifId);
+      if (match) {
+        chrome.tabs.update(match.id, { active: true });
+        chrome.windows.update(match.windowId, { focused: true });
+      } else {
+        chrome.tabs.create({ url: targetUrl });
+      }
+      chrome.notifications.clear(notifId);
+    });
   });
 });
 
