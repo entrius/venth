@@ -803,9 +803,13 @@ def _refuse_execution(no_trade_reason: str | None, force: bool, doing_live: bool
 
 
 def _parse_screen_arg(screen_arg: str) -> set[int]:
-    """Parse --screen flag into set of screen numbers (1-4)."""
-    if screen_arg.strip().lower() == "all":
+    """Parse --screen flag into set of screen numbers (1-4).
+    Use 'none' to skip all analysis screens (useful with --execute to show only execution)."""
+    val = screen_arg.strip().lower()
+    if val == "all":
         return {1, 2, 3, 4}
+    if val in ("none", "0"):
+        return set()
     screens: set[int] = set()
     for part in screen_arg.split(","):
         part = part.strip()
@@ -822,7 +826,7 @@ def main():
     parser.add_argument("--view", default=None, choices=["bullish", "bearish", "neutral", "vol"])
     parser.add_argument("--risk", default=None, choices=["low", "medium", "high"])
     parser.add_argument("--screen", default="all",
-                        help="Screens to show: comma-separated 1,2,3,4 or 'all' (default: all)")
+                        help="Screens to show: comma-separated 1,2,3,4, 'all', or 'none' (default: all)")
     parser.add_argument("--no-prompt", action="store_true", dest="no_prompt",
                         help="Skip pause between screens (dump all at once)")
     parser.add_argument("--execute", default=None, choices=["best", "safer", "upside"],
