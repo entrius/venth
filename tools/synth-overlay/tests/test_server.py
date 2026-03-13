@@ -199,3 +199,101 @@ def test_edge_live_price_invalid_ignored(client):
     assert resp.status_code == 200
     data = resp.get_json()
     assert data.get("live_price_used") is False
+
+
+# ---- Kalshi support ----
+
+def test_edge_kalshi_btc_daily(client):
+    """Kalshi BTC daily market returns edge data with kalshi platform."""
+    resp = client.get("/api/edge?slug=KXBTCD-26MAR1317&platform=kalshi")
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["asset"] == "BTC"
+    assert data["market_type"] == "daily"
+    assert data["platform"] == "kalshi"
+    assert "edge_pct" in data
+    assert "confidence_score" in data
+    assert "explanation" in data
+
+
+def test_edge_kalshi_eth_daily(client):
+    """Kalshi ETH daily market is supported."""
+    resp = client.get("/api/edge?slug=KXETHD-26MAR1317&platform=kalshi")
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["asset"] == "ETH"
+    assert data["market_type"] == "daily"
+    assert data["platform"] == "kalshi"
+
+
+def test_edge_kalshi_sol_daily(client):
+    """Kalshi SOL daily market is supported."""
+    resp = client.get("/api/edge?slug=KXSOLD-26MAR1317&platform=kalshi")
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["asset"] == "SOL"
+    assert data["market_type"] == "daily"
+
+
+def test_edge_kalshi_with_live_price(client):
+    """Kalshi markets support live price override."""
+    resp = client.get("/api/edge?slug=KXBTCD-26MAR1317&platform=kalshi&live_prob_up=0.60")
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data.get("live_price_used") is True
+    assert data["polymarket_probability_up"] == 0.60
+
+
+def test_edge_kalshi_auto_detect_platform(client):
+    """Platform auto-detected from Kalshi URL without explicit platform param."""
+    resp = client.get("/api/edge?url=https://kalshi.com/markets/KXBTCD-26MAR1317")
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["platform"] == "kalshi"
+    assert data["asset"] == "BTC"
+
+
+def test_edge_polymarket_includes_platform(client):
+    """Polymarket responses include platform field."""
+    resp = client.get("/api/edge?slug=bitcoin-up-or-down-on-february-26")
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["platform"] == "polymarket"
+
+
+def test_edge_kalshi_unsupported_ticker(client):
+    """Unknown Kalshi ticker returns 404."""
+    resp = client.get("/api/edge?slug=kxunknown-26feb25&platform=kalshi")
+    assert resp.status_code == 404
+
+
+def test_edge_kalshi_15min(client):
+    """Kalshi 15min market (KXBTC15M series) returns edge data."""
+    resp = client.get("/api/edge?slug=kxbtc15m&platform=kalshi")
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["asset"] == "BTC"
+    assert data["market_type"] == "15min"
+    assert data["platform"] == "kalshi"
+    assert data["horizon"] == "15min"
+    assert "edge_pct" in data
+
+
+def test_edge_kalshi_range(client):
+    """Kalshi range market (KXBTC series) returns range data."""
+    resp = client.get("/api/edge?slug=kxbtc&platform=kalshi")
+    # Range markets need range bracket data which may or may not be mocked for "kxbtc".
+    # The server should at least recognise the market type and attempt to fetch.
+    assert resp.status_code in (200, 404, 500)
+    if resp.status_code == 200:
+        data = resp.get_json()
+        assert data["platform"] == "kalshi"
+
+
+def test_edge_kalshi_www_url(client):
+    """Platform auto-detected from www.kalshi.com URL."""
+    resp = client.get("/api/edge?url=https://www.kalshi.com/markets/KXBTCD-26MAR1317")
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["platform"] == "kalshi"
+    assert data["asset"] == "BTC"

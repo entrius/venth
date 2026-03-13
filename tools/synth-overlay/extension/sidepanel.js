@@ -6,9 +6,11 @@ const API_BASE = "http://127.0.0.1:8765";
 var cachedSynthData = null;
 var cachedMarketType = null;
 var currentSlug = null;
+var currentPlatform = null;
 
 const els = {
   statusText: document.getElementById("statusText"),
+  marketLabel: document.getElementById("marketLabel"),
   synthUp: document.getElementById("synthUp"),
   synthDown: document.getElementById("synthDown"),
   polyUp: document.getElementById("polyUp"),
@@ -72,11 +74,19 @@ function fmtDelta(synth, poly) {
   };
 }
 
+function isSupportedUrl(url) {
+  return url && (
+    url.startsWith("https://polymarket.com/") ||
+    url.startsWith("https://kalshi.com/")
+  );
+}
+
 async function activeSupportedTab() {
   const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
   const tab = tabs && tabs[0];
-  if (!tab || !tab.url || !tab.url.startsWith("https://polymarket.com/")) return null;
-  return tab;
+  if (!tab || !tab.url) return null;
+  if (isSupportedUrl(tab.url)) return tab;
+  return null;
 }
 
 async function getContextFromPage(tabId) {
@@ -88,11 +98,14 @@ async function getContextFromPage(tabId) {
   }
 }
 
-async function fetchEdge(slug, livePrices) {
+async function fetchEdge(slug, livePrices, platform) {
   var url = API_BASE + "/api/edge?slug=" + encodeURIComponent(slug);
   // Pass live prices to server if available for real-time edge calculation
   if (livePrices && livePrices.upPrice != null) {
     url += "&live_prob_up=" + encodeURIComponent(livePrices.upPrice);
+  }
+  if (platform) {
+    url += "&platform=" + encodeURIComponent(platform);
   }
   const res = await fetch(url);
   if (!res.ok) return null;
@@ -101,6 +114,7 @@ async function fetchEdge(slug, livePrices) {
 
 function render(state) {
   els.statusText.textContent = state.status;
+  if (els.marketLabel) els.marketLabel.textContent = state.marketLabel || "Market";
   els.synthUp.textContent = state.synthUp;
   els.synthDown.textContent = state.synthDown;
   els.polyUp.textContent = state.polyUp || "—";
@@ -383,7 +397,7 @@ async function refresh() {
   const tab = await activeSupportedTab();
   if (!tab) {
     render(Object.assign({}, EMPTY, {
-      status: "Open a Polymarket event tab to view Synth data.",
+      status: "Open a Polymarket or Kalshi event tab to view Synth data.",
       analysis: "No active market tab found.",
     }));
     return;
@@ -391,14 +405,49 @@ async function refresh() {
 
   const ctx = await getContextFromPage(tab.id);
   if (!ctx || !ctx.slug) {
+    var platformHint = "";
+    if (tab.url && tab.url.indexOf("kalshi.com") !== -1) {
+      platformHint = "Navigate to a Kalshi market page (e.g. kalshi.com/markets/kxbtcd) to see Synth data.";
+    } else {
+      platformHint = "Navigate to a specific market page to see Synth data.";
+    }
+
+    // If the content script found Kalshi market links, show them as suggestions
+    if (ctx && ctx.suggestedMarkets && ctx.suggestedMarkets.length > 0) {
+      platformHint += "\n\nDetected markets on this page — click one:";
+    }
+
     render(Object.assign({}, EMPTY, {
-      status: "Could not read market context from page.",
-      analysis: "Reload the page and try refresh again.",
+      status: "No market detected on this page.",
+      analysis: platformHint,
     }));
+
+    // Append clickable market buttons
+    if (ctx && ctx.suggestedMarkets && ctx.suggestedMarkets.length > 0 && els.analysisText) {
+      var container = document.createElement("div");
+      container.style.cssText = "margin-top:8px;display:flex;flex-wrap:wrap;gap:4px;";
+      for (var si = 0; si < ctx.suggestedMarkets.length; si++) {
+        (function(mkt) {
+          var btn = document.createElement("button");
+          btn.textContent = mkt.ticker;
+          btn.title = mkt.label;
+          btn.style.cssText = "padding:3px 8px;font-size:11px;border:1px solid #555;border-radius:4px;background:#2a2a3e;color:#e0e0f0;cursor:pointer;";
+          btn.addEventListener("click", function() {
+            // Navigate the active tab to this market
+            chrome.tabs.update(tab.id, { url: "https://kalshi.com" + (mkt.href.startsWith("/") ? "" : "/") + mkt.href });
+          });
+          container.appendChild(btn);
+        })(ctx.suggestedMarkets[si]);
+      }
+      els.analysisText.parentElement.appendChild(container);
+    }
+
     return;
   }
 
-  const edge = await fetchEdge(ctx.slug, ctx.livePrices);
+  var ctxPlatform = ctx.platform || "polymarket";
+
+  const edge = await fetchEdge(ctx.slug, ctx.livePrices, ctxPlatform);
   if (!edge || edge.error) {
     render(Object.assign({}, EMPTY, {
       status: "Market not supported by Synth for this slug.",
@@ -418,6 +467,7 @@ async function refresh() {
   cachedSynthData = edge;
   cachedMarketType = mtype;
   currentSlug = ctx.slug;
+  currentPlatform = ctxPlatform;
   if (typeof updateWatchBtnState === "function") updateWatchBtnState();
 
   // Log live price status for debugging
@@ -451,8 +501,10 @@ async function refresh() {
   }
 
   var liveStatus = ctx.livePrices ? " (Live)" : "";
+  var platformLabel = ctxPlatform === "kalshi" ? "Kalshi" : "Poly";
   render({
     status: "Synced — " + asset + " " + horizon + " forecast." + liveStatus,
+    marketLabel: platformLabel,
     synthUp: fmtCentsFromProb(synthProbUp),
     synthDown: synthProbUp == null ? "—" : fmtCentsFromProb(1 - synthProbUp),
     polyUp: fmtCentsFromProb(polyProbUp),
@@ -534,7 +586,7 @@ chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
 
 // Also detect tab URL changes (full navigations)
 chrome.tabs.onUpdated.addListener(function(tabId, changeInfo, tab) {
-  if (changeInfo.url && tab.active && tab.url && tab.url.startsWith("https://polymarket.com/")) {
+  if (changeInfo.url && tab.active && tab.url && isSupportedUrl(tab.url)) {
     console.log("[Synth-Overlay] Tab URL updated:", changeInfo.url);
     cachedSynthData = null;
     cachedMarketType = null;

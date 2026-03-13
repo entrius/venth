@@ -1,5 +1,6 @@
 var SUPPORTED_ORIGINS = [
-  "https://polymarket.com/"
+  "https://polymarket.com/",
+  "https://kalshi.com/"
 ];
 
 var API_BASE = "http://127.0.0.1:8765";
@@ -20,6 +21,7 @@ var STORE_KEYS = {
 var COOLDOWN_MS = 5 * 60 * 1000;
 
 function isSupportedUrl(url) {
+  if (!url) return false;
   for (var i = 0; i < SUPPORTED_ORIGINS.length; i++) {
     if (url.indexOf(SUPPORTED_ORIGINS[i]) === 0) return true;
   }
@@ -170,7 +172,9 @@ function suppressAndNotify(item, data, cooldowns) {
 
     chrome.tabs.query({ active: true, lastFocusedWindow: true }, function (tabs) {
       var activeUrl = (tabs && tabs[0] && tabs[0].url) || "";
-      if (activeUrl.indexOf("polymarket.com") !== -1 && activeUrl.indexOf(item.slug) !== -1) {
+      var onMarketPage = (activeUrl.indexOf("polymarket.com") !== -1 || activeUrl.indexOf("kalshi.com") !== -1)
+        && activeUrl.indexOf(item.slug) !== -1;
+      if (onMarketPage) {
         return;
       }
       cooldowns[item.slug] = Date.now();
@@ -242,15 +246,20 @@ function createEdgeNotification(notifId, item, data) {
   });
 }
 
-// Focus or open the Polymarket page for the clicked notification
+// Focus or open the market page for the clicked notification
 chrome.notifications.onClicked.addListener(function (notifId) {
   if (notifId.indexOf("synth-edge::") !== 0) return;
   var slug = notifId.replace("synth-edge::", "");
   if (!slug) { chrome.notifications.clear(notifId); return; }
 
-  var targetUrl = "https://polymarket.com/event/" + slug;
+  // Determine platform from slug format
+  var isKalshi = slug.toLowerCase().indexOf("kx") === 0;
+  var targetUrl = isKalshi
+    ? "https://kalshi.com/markets/" + slug
+    : "https://polymarket.com/event/" + slug;
+  var searchPattern = isKalshi ? "https://kalshi.com/*" : "https://polymarket.com/*";
 
-  chrome.tabs.query({ url: "https://polymarket.com/*" }, function (tabs) {
+  chrome.tabs.query({ url: searchPattern }, function (tabs) {
     var match = null;
     for (var i = 0; i < tabs.length; i++) {
       if (tabs[i].url && tabs[i].url.indexOf(slug) !== -1) {

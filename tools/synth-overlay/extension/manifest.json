@@ -6,6 +6,8 @@
   "permissions": ["activeTab", "tabs", "sidePanel", "notifications", "storage", "alarms"],
   "host_permissions": [
     "https://polymarket.com/*",
+    "https://kalshi.com/*",
+    "https://*.kalshi.com/*",
     "http://127.0.0.1:8765/*"
   ],
   "background": {
@@ -30,7 +32,9 @@
   "content_scripts": [
     {
       "matches": [
-        "https://polymarket.com/*"
+        "https://polymarket.com/*",
+        "https://kalshi.com/*",
+        "https://*.kalshi.com/*"
       ],
       "js": ["content.js"],
       "run_at": "document_idle"
