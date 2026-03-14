@@ -1,6 +1,6 @@
 """Autonomous execution engine for Options GPS.
 Consumes pipeline.py data classes and exchange.py pricing functions.
-Supports Deribit (JSON-RPC 2.0), Aevo (REST + HMAC-SHA256), and dry-run simulation.
+Supports Deribit (JSON-RPC 2.0), Aevo (REST + EIP-712 L2 signing), and dry-run simulation.
 Auto-routing uses leg_divergences to pick the best venue per leg.
 Includes order monitoring, auto-cancel on partial failure, slippage protection,
 max-loss budget, position sizing, and execution audit logging."""
@@ -9,6 +9,7 @@ import hashlib
 import hmac
 import json
 import os
+import random
 import time
 import uuid
 from abc import ABC, abstractmethod
@@ -16,6 +17,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import requests
+
+try:
+    from eth_account import Account as _EthAccount
+    _HAS_ETH_ACCOUNT = True
+except ImportError:
+    _HAS_ETH_ACCOUNT = False
 
 from exchange import best_execution_price, leg_divergences
 
@@ -407,20 +414,53 @@ class DeribitExecutor(BaseExecutor):
 
 
 class AevoExecutor(BaseExecutor):
-    """Executes orders on Aevo via REST API with HMAC-SHA256 signing.
-    Signs timestamp + HTTP method + path + body per Aevo spec.
+    """Executes orders on Aevo via REST API with EIP-712 L2 signing.
+    Aevo is an OP Stack L2 — every order must carry an EIP-712 signature
+    signed by the trading key. The REST HMAC headers authenticate the
+    request; the payload signature authorises the on-chain settlement.
     Retries on transient errors (429, 502, 503, timeout)."""
 
-    def __init__(self, api_key: str, api_secret: str, testnet: bool = False):
+    # EIP-712 domain separators (per Aevo SDK)
+    _DOMAIN_MAINNET = {"name": "Aevo Mainnet", "version": "1", "chainId": 1}
+    _DOMAIN_TESTNET = {"name": "Aevo Testnet", "version": "1", "chainId": 11155111}
+
+    # EIP-712 Order struct type definition
+    _ORDER_TYPES = {
+        "Order": [
+            {"name": "maker", "type": "address"},
+            {"name": "isBuy", "type": "bool"},
+            {"name": "limitPrice", "type": "uint256"},
+            {"name": "amount", "type": "uint256"},
+            {"name": "salt", "type": "uint256"},
+            {"name": "instrument", "type": "uint256"},
+            {"name": "timestamp", "type": "uint256"},
+        ],
+    }
+
+    def __init__(self, api_key: str, api_secret: str,
+                 signing_key: str, wallet_address: str,
+                 testnet: bool = False):
+        if not _HAS_ETH_ACCOUNT:
+            raise ImportError(
+                "eth-account is required for Aevo L2 signing. "
+                "Install it: pip install eth-account"
+            )
         self.api_key = api_key
         self.api_secret = api_secret
+        self.signing_key = signing_key
+        self.wallet_address = wallet_address
+        self.testnet = testnet
         self.base_url = (
             "https://api-testnet.aevo.xyz"
             if testnet
             else "https://api.aevo.xyz"
         )
+        self._domain = self._DOMAIN_TESTNET if testnet else self._DOMAIN_MAINNET
+        # Cache: human-readable instrument name → numeric instrument ID
+        self._instrument_cache: dict[str, int] = {}
 
-    def _sign(self, timestamp: str, method: str, path: str, body: str) -> str:
+    def _sign_hmac(self, timestamp: str, method: str, path: str, body: str) -> str:
+        """HMAC-SHA256 for REST API authentication headers."""
         message = f"{timestamp}{method}{path}{body}"
         return hmac.new(
             self.api_secret.encode(), message.encode(), hashlib.sha256,
@@ -431,26 +471,93 @@ class AevoExecutor(BaseExecutor):
         return {
             "AEVO-KEY": self.api_key,
             "AEVO-TIMESTAMP": ts,
-            "AEVO-SIGNATURE": self._sign(ts, method, path, body),
+            "AEVO-SIGNATURE": self._sign_hmac(ts, method, path, body),
             "Content-Type": "application/json",
         }
 
+    def _sign_order(self, instrument_id: int, is_buy: bool,
+                    limit_price: float, quantity: int,
+                    timestamp: int) -> tuple[int, str]:
+        """EIP-712 L2 order signing. Returns (salt, signature_hex)."""
+        salt = random.randint(0, 10**10)
+        message_data = {
+            "maker": self.wallet_address,
+            "isBuy": is_buy,
+            "limitPrice": int(limit_price * 10**6),
+            "amount": int(quantity * 10**6),
+            "salt": salt,
+            "instrument": instrument_id,
+            "timestamp": timestamp,
+        }
+        signed = _EthAccount.sign_typed_data(
+            self.signing_key,
+            domain_data=self._domain,
+            message_types=self._ORDER_TYPES,
+            message_data=message_data,
+        )
+        return salt, "0x" + signed.signature.hex()
+
+    def _resolve_instrument_id(self, instrument_name: str) -> int:
+        """Look up numeric instrument ID from Aevo /markets endpoint.
+        Caches results for the session."""
+        if instrument_name in self._instrument_cache:
+            return self._instrument_cache[instrument_name]
+        try:
+            resp = requests.get(
+                f"{self.base_url}/markets",
+                headers=self._headers("GET", "/markets"),
+                params={"instrument_name": instrument_name},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            # Response can be a list of markets or a single market
+            if isinstance(data, list):
+                for market in data:
+                    name = market.get("instrument_name", "")
+                    mid = int(market.get("instrument_id", 0))
+                    self._instrument_cache[name] = mid
+                if instrument_name in self._instrument_cache:
+                    return self._instrument_cache[instrument_name]
+            elif isinstance(data, dict):
+                mid = int(data.get("instrument_id", 0))
+                self._instrument_cache[instrument_name] = mid
+                return mid
+        except Exception:
+            pass
+        raise ValueError(
+            f"Could not resolve Aevo instrument ID for '{instrument_name}'. "
+            "Verify the instrument exists on Aevo."
+        )
+
     def authenticate(self) -> bool:
-        return bool(self.api_key and self.api_secret)
+        return bool(self.api_key and self.api_secret
+                     and self.signing_key and self.wallet_address)
 
     def place_order(self, order: OrderRequest) -> OrderResult:
         t0 = time.monotonic()
         ts = _now_iso()
-        payload = {
-            "instrument": order.instrument,
-            "side": order.action.lower(),
-            "quantity": order.quantity,
-            "order_type": order.order_type,
-        }
-        if order.order_type == "limit":
-            payload["price"] = order.price
-        body = json.dumps(payload)
         try:
+            instrument_id = self._resolve_instrument_id(order.instrument)
+            is_buy = order.action == "BUY"
+            timestamp = int(time.time())
+            salt, signature = self._sign_order(
+                instrument_id, is_buy, order.price, order.quantity, timestamp,
+            )
+            payload = {
+                "maker": self.wallet_address,
+                "is_buy": is_buy,
+                "instrument": instrument_id,
+                "limit_price": str(int(order.price * 10**6)),
+                "amount": str(int(order.quantity * 10**6)),
+                "salt": str(salt),
+                "signature": signature,
+                "timestamp": timestamp,
+            }
+            if order.order_type == "limit":
+                payload["post_only"] = True
+            body = json.dumps(payload)
+
             def _call():
                 resp = requests.post(
                     f"{self.base_url}/orders",
@@ -500,8 +607,8 @@ class AevoExecutor(BaseExecutor):
                 status=data.get("status", "unknown"),
                 fill_price=float(data.get("avg_price", 0)),
                 fill_quantity=int(data.get("filled", 0)),
-                instrument=data.get("instrument", ""),
-                action=data.get("side", "").upper(),
+                instrument=data.get("instrument_name", ""),
+                action="BUY" if data.get("is_buy") else "SELL",
                 exchange="aevo",
             )
         except Exception:
@@ -917,13 +1024,21 @@ def get_executor(exchange: str | None, exchange_quotes: list,
     if exchange == "aevo":
         api_key = os.environ.get("AEVO_API_KEY", "")
         api_secret = os.environ.get("AEVO_API_SECRET", "")
+        signing_key = os.environ.get("AEVO_SIGNING_KEY", "")
+        wallet_address = os.environ.get("AEVO_WALLET_ADDRESS", "")
         if not api_key or not api_secret:
             raise ValueError(
                 "Aevo credentials required: set AEVO_API_KEY and "
                 "AEVO_API_SECRET environment variables"
             )
+        if not signing_key or not wallet_address:
+            raise ValueError(
+                "Aevo L2 signing credentials required: set AEVO_SIGNING_KEY "
+                "(Ethereum private key) and AEVO_WALLET_ADDRESS environment variables. "
+                "Generate a signing key at https://app.aevo.xyz → Enable Trading."
+            )
         testnet = os.environ.get("AEVO_TESTNET", "").strip() == "1"
-        return AevoExecutor(api_key, api_secret, testnet)
+        return AevoExecutor(api_key, api_secret, signing_key, wallet_address, testnet)
 
     raise ValueError(
         f"Unknown exchange '{exchange}'. Use --exchange deribit or --exchange aevo"

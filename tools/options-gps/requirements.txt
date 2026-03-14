@@ -2,3 +2,4 @@
 # The synth_client package is included in the repo — no need to list it.
 # requests is needed if you want to use live API mode.
 requests>=2.28.0
+eth-account>=0.13.0  # EIP-712 L2 signing for Aevo order placement

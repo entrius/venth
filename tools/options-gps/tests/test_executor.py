@@ -353,6 +353,8 @@ class TestGetExecutor:
     def test_missing_aevo_creds(self, sample_exchange_quotes, monkeypatch):
         monkeypatch.delenv("AEVO_API_KEY", raising=False)
         monkeypatch.delenv("AEVO_API_SECRET", raising=False)
+        monkeypatch.delenv("AEVO_SIGNING_KEY", raising=False)
+        monkeypatch.delenv("AEVO_WALLET_ADDRESS", raising=False)
         with pytest.raises(ValueError, match="AEVO_API_KEY"):
             get_executor("aevo", sample_exchange_quotes, dry_run=False)
 
@@ -526,21 +528,47 @@ class TestExecutionSavings:
         assert compute_execution_savings(plan, btc_option_data)["savings_usd"] > 0
 
 
-# --- 12. Aevo Signing (3 tests) ---
+# --- 12. Aevo L2 Signing (5 tests) ---
+
+def _make_aevo(**kwargs):
+    defaults = {
+        "api_key": "test-key", "api_secret": "test-secret",
+        "signing_key": "0x" + "ab" * 32,
+        "wallet_address": "0x" + "cd" * 20,
+        "testnet": True,
+    }
+    defaults.update(kwargs)
+    return AevoExecutor(**defaults)
+
 
 class TestAevoSigning:
-    def test_four_part_signature(self):
-        executor = AevoExecutor("test-key", "test-secret", testnet=True)
-        sig = executor._sign("12345", "POST", "/orders", '{"side":"buy"}')
+    def test_hmac_four_part_signature(self):
+        executor = _make_aevo()
+        sig = executor._sign_hmac("12345", "POST", "/orders", '{"side":"buy"}')
         expected = hmac_mod.new(b"test-secret", b'12345POST/orders{"side":"buy"}', hashlib.sha256).hexdigest()
         assert sig == expected
 
     def test_headers(self):
-        h = AevoExecutor("my-key", "my-secret", testnet=True)._headers("POST", "/orders", '{}')
+        h = _make_aevo(api_key="my-key", api_secret="my-secret")._headers("POST", "/orders", '{}')
         assert h["AEVO-KEY"] == "my-key" and "AEVO-TIMESTAMP" in h and "AEVO-SIGNATURE" in h
 
     def test_empty_body(self):
-        assert len(AevoExecutor("k", "s", testnet=True)._sign("9", "GET", "/x", "")) == 64
+        assert len(_make_aevo(api_key="k", api_secret="s")._sign_hmac("9", "GET", "/x", "")) == 64
+
+    def test_eip712_order_signing(self):
+        executor = _make_aevo()
+        salt, sig = executor._sign_order(
+            instrument_id=11235, is_buy=True,
+            limit_price=65500.0, quantity=1, timestamp=1700000000,
+        )
+        assert isinstance(salt, int) and salt > 0
+        assert sig.startswith("0x") and len(sig) == 132  # 0x + 65 bytes hex
+
+    def test_authenticate_requires_all_four(self):
+        full = _make_aevo()
+        assert full.authenticate() is True
+        partial = _make_aevo(signing_key="", wallet_address="")
+        assert partial.authenticate() is False
 
 
 # --- 13. Deribit Price Conversion (4 tests) ---
