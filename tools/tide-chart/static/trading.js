@@ -43,6 +43,10 @@ function getTradeHistory() {
 }
 
 function saveTradeToHistory(entry) {
+  if (entry.lev === '0x' || entry.lev === '?x') return;
+  if (!entry.collateral || parseFloat(entry.collateral) <= 0) return;
+  if (!entry.entryPrice || parseFloat(entry.entryPrice) <= 0) return;
+  
   var history = getTradeHistory();
   history.unshift(entry);
   if (history.length > 50) history = history.slice(0, 50);
@@ -1259,7 +1263,13 @@ async function loadTradeHistory() {
     }
   });
 
-  // Limit to 20 most recent
+  // Filter out invalid/zeroed-out trades and limit to 20 most recent
+  merged = merged.filter(function(h) {
+    if (h.lev === '0x' || h.lev === '?x') return false;
+    if (!h.collateral || parseFloat(h.collateral) <= 0) return false;
+    if (!h.entryPrice || parseFloat(h.entryPrice) <= 0) return false;
+    return true;
+  });
   merged = merged.slice(0, 20);
 
   if (merged.length === 0) {
