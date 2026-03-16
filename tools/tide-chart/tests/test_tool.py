@@ -753,7 +753,7 @@ def test_flask_gtrade_resolve_pair_invalid():
 
 
 def test_flask_gtrade_resolve_pair_valid():
-    """Verify resolve-pair returns for a valid asset (pair_index may be None without live API)."""
+    """Verify resolve-pair returns for a valid asset and includes current_price when Synth data is available."""
     client = _make_client()
     app = create_app(client)
     with app.test_client() as tc:
@@ -762,6 +762,10 @@ def test_flask_gtrade_resolve_pair_valid():
         data = json.loads(resp.data)
         assert data["asset"] == "SPY"
         assert "pair_index" in data
+        # In mock mode, SynthClient is backed by local prediction percentiles,
+        # so current_price should be present and numeric.
+        assert "current_price" in data
+        assert isinstance(data["current_price"], (int, float))
 
 
 def test_dashboard_html_contains_wallet_ui():

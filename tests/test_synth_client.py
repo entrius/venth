@@ -128,3 +128,25 @@ def test_leaderboard(client, asset):
     if len(data) > 0:
         assert "neuron_uid" in data[0]
         assert "rewards" in data[0]
+
+
+def test_get_asset_summary_returns_current_price(client):
+    summary = client.get_asset_summary("BTC", horizon="24h")
+    assert summary["asset"] == "BTC"
+    assert summary["horizon"] == "24h"
+    assert "current_price" in summary
+    assert isinstance(summary["current_price"], (int, float))
+
+
+def test_get_asset_summary_rejects_unsupported_asset(client):
+    import pytest
+
+    with pytest.raises(ValueError):
+        client.get_asset_summary("DOGE", horizon="24h")
+
+
+def test_get_asset_summary_rejects_unsupported_horizon(client):
+    import pytest
+
+    with pytest.raises(ValueError):
+        client.get_asset_summary("BTC", horizon="7d")

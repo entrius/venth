@@ -1048,15 +1048,25 @@ def create_app(client=None) -> Flask:
         except Exception:
             trading_vars = None
         pair_index = resolve_pair_index(asset, trading_vars, skip_fetch=True)
-        # Include fresh price for the frontend openTrade struct
+        # Include fresh price for the frontend openTrade struct.
+        # Use SynthClient's forecast percentiles helper instead of a hard-coded,
+        # non-existent client method to keep this logic aligned with the SDK.
         current_price = None
         try:
-            summary = client.get_asset_summary(asset)
-            if summary and "current_price" in summary:
-                current_price = summary["current_price"]
+            summary = client.get_asset_summary(asset, horizon="24h")
+            current_price = summary.get("current_price")
         except Exception:
-            pass
-        return jsonify({"asset": asset, "pair_index": pair_index, "current_price": current_price})
+            # If Synth data is temporarily unavailable, still return a valid
+            # response shape so the frontend can fall back gracefully.
+            current_price = None
+
+        return jsonify(
+            {
+                "asset": asset,
+                "pair_index": pair_index,
+                "current_price": current_price,
+            }
+        )
 
     @app.route("/api/gtrade/open-trades")
     def gtrade_open_trades():
