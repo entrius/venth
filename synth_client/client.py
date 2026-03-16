@@ -107,6 +107,51 @@ class SynthClient:
             return self._load_mock(*mock_path_parts)
         return self._request(path, params)
 
+    # ─── Asset Summary Helper ────────────────────────────────────────
+
+    def get_asset_summary(self, asset: str, horizon: str = "24h") -> dict:
+        """
+        Lightweight helper to expose the latest forecast snapshot for an asset.
+
+        This is primarily used by downstream tools (e.g. Tide Chart gTrade
+        integration) that only need a current price and basic forecast context,
+        without re‑implementing Synth API plumbing.
+
+        Args:
+            asset: Asset symbol (must be one of SUPPORTED_ASSETS)
+            horizon: Forecast horizon — "1h" or "24h" (default: "24h")
+
+        Returns:
+            Dict with at least:
+                - asset
+                - horizon
+                - current_price
+                - forecast_future (if available from prediction percentiles)
+
+        Raises:
+            ValueError: If asset or horizon is not supported.
+            FileNotFoundError / requests.HTTPError: Propagated from underlying
+                forecast fetch when data is unavailable.
+        """
+        if asset not in SUPPORTED_ASSETS:
+            raise ValueError(f"Unsupported asset: {asset}. Supported: {SUPPORTED_ASSETS}")
+        if horizon not in SUPPORTED_HORIZONS:
+            raise ValueError(
+                f"Unsupported horizon: {horizon}. Supported: {SUPPORTED_HORIZONS}"
+            )
+
+        pct = self.get_prediction_percentiles(asset, horizon=horizon)
+        summary: dict = {
+            "asset": asset,
+            "horizon": horizon,
+            "current_price": pct.get("current_price"),
+        }
+
+        if "forecast_future" in pct:
+            summary["forecast_future"] = pct["forecast_future"]
+
+        return summary
+
     # ─── Prediction Percentiles ──────────────────────────────────────
 
     def get_prediction_percentiles(self, asset: str, horizon: str = "24h") -> dict:
