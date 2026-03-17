@@ -923,6 +923,8 @@ def get_executor(
             )
         testnet = os.environ.get("AEVO_TESTNET", "").strip() == "1"
         return AevoExecutor(api_key, api_secret, signing_key, wallet_address, testnet)
+    if exchange == "derive":
+        raise NotImplementedError("Execution on Derive is not yet implemented. Options pricing only.")
     raise ValueError(
-        f"Unknown exchange '{exchange}'. Use --exchange deribit or --exchange aevo"
+        f"Unknown exchange '{exchange}'. Use --exchange deribit, --exchange aevo, or --exchange derive"
     )

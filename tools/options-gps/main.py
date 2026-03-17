@@ -11,6 +11,9 @@ import warnings
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from synth_client import SynthClient
 
 from pipeline import (
@@ -76,6 +79,9 @@ def load_synth_data(client: SynthClient, asset: str) -> dict | None:
     except Exception:
         pass
     expiry = options.get("expiry_time", "")
+    if not expiry: # Fallback if expiry_time is not provided
+        target_dt = datetime.now() + timedelta(days=7)
+        expiry = target_dt.isoformat() # Convert datetime object to string for consistency
     return {
         "p1h_last": p1h_last,
         "p24h_last": percentiles_list_24h[-1],
@@ -199,21 +205,23 @@ def screen_view_setup(preset_symbol: str | None = None, preset_view: str | None 
     return symbol, view, risk
 
 
-def _line_shopping_side(exchange_quotes, deribit_quotes, aevo_quotes, opts, strike, opt_type):
+def _line_shopping_side(exchange_quotes, deribit_quotes, aevo_quotes, derive_quotes, opts, strike, opt_type):
     """Build data for one side (call or put) of a strike row.
-    Returns all original columns: fair, deribit_mid, aevo_mid, execute_venue, execute_price, edge, marker."""
+    Returns all original columns: fair, deribit_mid, aevo_mid, derive_mid, execute_venue, execute_price, edge, marker."""
     sk = str(int(strike)) if strike == int(strike) else str(strike)
     fair = float(opts.get(sk, 0))
     if fair <= 0.01:
         return None
     best_deribit = best_market_price(deribit_quotes, strike, opt_type)
     best_aevo = best_market_price(aevo_quotes, strike, opt_type)
+    best_derive = best_market_price(derive_quotes, strike, opt_type)
     edge = compute_edge(fair, exchange_quotes, strike, opt_type)
     best = best_market_price(exchange_quotes, strike, opt_type)
     return {
         "fair": fair,
         "deribit_mid": best_deribit.mid if best_deribit else None,
         "aevo_mid": best_aevo.mid if best_aevo else None,
+        "derive_mid": best_derive.mid if best_derive else None,
         "exec_venue": best.exchange.upper()[:3] if best else None,
         "exec_ask": best.ask if best else None,
         "z_score": edge.z_score if edge else None,
@@ -228,21 +236,22 @@ def _fmt_price(val, width=7):
 
 
 # Column widths for line shopping table (per side)
-_W = {"synth": 7, "der": 6, "aev": 6, "exec": 9, "edge": 6}
-# Side = synth + sp + der + sp + aev + 2sp + exec + sp + edge
-_SIDE_W = _W["synth"] + 1 + _W["der"] + 1 + _W["aev"] + 2 + _W["exec"] + 1 + _W["edge"]
+_W = {"synth": 7, "der": 6, "aev": 6, "drv": 6, "exec": 9, "edge": 6}
+# Side = synth + sp + der + sp + aev + sp + drv + 2sp + exec + sp + edge
+_SIDE_W = _W["synth"] + 1 + _W["der"] + 1 + _W["aev"] + 1 + _W["drv"] + 2 + _W["exec"] + 1 + _W["edge"]
 
 
 def _fmt_side(side):
     """Format one side (call or put) of a strike row with all columns."""
     dash = lambda w: f"{'---':>{w}s}"
     if side is None:
-        return f"{dash(_W['synth'])} {dash(_W['der'])} {dash(_W['aev'])}  {dash(_W['exec'])} {dash(_W['edge'])}"
+        return f"{dash(_W['synth'])} {dash(_W['der'])} {dash(_W['aev'])} {dash(_W['drv'])}  {dash(_W['exec'])} {dash(_W['edge'])}"
     fair_s = _fmt_price(side["fair"], _W["synth"])
     der_s = _fmt_price(side["deribit_mid"], _W["der"])
     aev_s = _fmt_price(side["aevo_mid"], _W["aev"])
+    drv_s = _fmt_price(side["derive_mid"], _W["drv"])
     if side["exec_venue"]:
-        venue = "DER" if side["exec_venue"].startswith("DER") else "AEV"
+        venue = side["exec_venue"]
         exec_s = f"{venue} {side['exec_ask']:>{_W['exec'] - 4},.0f}"
     else:
         exec_s = dash(_W["exec"])
@@ -251,7 +260,7 @@ def _fmt_side(side):
         edge_s = f"{raw:>{_W['edge']}s}"
     else:
         edge_s = dash(_W["edge"])
-    return f"{fair_s} {der_s} {aev_s}  {exec_s} {edge_s}"
+    return f"{fair_s} {der_s} {aev_s} {drv_s}  {exec_s} {edge_s}"
 
 
 def _print_line_shopping_table(exchange_quotes: list, synth_options: dict, current_price: float):
@@ -270,10 +279,11 @@ def _print_line_shopping_table(exchange_quotes: list, synth_options: dict, curre
     nearby = all_strikes[start:end]
     deribit_quotes = [q for q in exchange_quotes if q.exchange == "deribit"]
     aevo_quotes = [q for q in exchange_quotes if q.exchange == "aevo"]
+    derive_quotes = [q for q in exchange_quotes if q.exchange == "derive"]
     rows = []
     for strike in nearby:
-        call_side = _line_shopping_side(exchange_quotes, deribit_quotes, aevo_quotes, call_opts, strike, "call")
-        put_side = _line_shopping_side(exchange_quotes, deribit_quotes, aevo_quotes, put_opts, strike, "put")
+        call_side = _line_shopping_side(exchange_quotes, deribit_quotes, aevo_quotes, derive_quotes, call_opts, strike, "call")
+        put_side = _line_shopping_side(exchange_quotes, deribit_quotes, aevo_quotes, derive_quotes, put_opts, strike, "put")
         if not call_side and not put_side:
             continue
         rows.append((strike, call_side, put_side))
@@ -281,7 +291,7 @@ def _print_line_shopping_table(exchange_quotes: list, synth_options: dict, curre
         return
     print(f"{BAR}")
     print(_section("MARKET LINE SHOPPING"))
-    side_hdr = (f"{'Synth':>{_W['synth']}s} {'DER':>{_W['der']}s} {'AEV':>{_W['aev']}s}"
+    side_hdr = (f"{'Synth':>{_W['synth']}s} {'DER':>{_W['der']}s} {'AEV':>{_W['aev']}s} {'DRV':>{_W['drv']}s}"
                 f"  {'* Exec':>{_W['exec']}s} {'Edge':>{_W['edge']}s}")
     strike_col = 8  # width of strike number
     atm_col = 3     # width of ATM marker
@@ -297,7 +307,7 @@ def _print_line_shopping_table(exchange_quotes: list, synth_options: dict, curre
         p_str = _fmt_side(put_side)
         print(f"{BAR}    {strike:>{strike_col},.0f}{atm} {c_str}{sep}{p_str}")
     print(f"{BAR}    {SEP * w}")
-    print(f"{BAR}    * Exec = best execution venue ask price (DER=Deribit, AEV=Aevo)")
+    print(f"{BAR}    * Exec = best execution venue ask price (DER=Deribit, AEV=Aevo, DRV=Derive)")
 
 
 def screen_market_context(symbol: str, current_price: float, confidence: float,
@@ -835,12 +845,12 @@ def main():
                         help="Simulate execution without placing real orders")
     parser.add_argument("--force", action="store_true",
                         help="Allow execution when guardrail recommends no trade")
-    parser.add_argument("--exchange", default=None, choices=["deribit", "aevo"],
+    parser.add_argument("--exchange", default=None, choices=["deribit", "aevo", "derive"],
                         help="Force exchange (default: auto-route per leg)")
     parser.add_argument("--max-slippage", type=float, default=0.0, dest="max_slippage",
                         help="Max allowed slippage %% (reject fill if exceeded, 0=off)")
-    parser.add_argument("--quantity", type=int, default=0,
-                        help="Override contract quantity for all legs (0=use strategy default)")
+    parser.add_argument("--quantity", type=float, default=0,
+                        help="Quantity to execute (0=derive from risk size). Ignored if --execute is not set.")
     parser.add_argument("--timeout", type=int, default=0,
                         help="Seconds to wait for order fill before cancelling (0=fire-and-forget)")
     args = parser.parse_args()
@@ -886,6 +896,10 @@ def main():
     if symbol in ("BTC", "ETH", "SOL"):
         mock_dir = os.path.join(os.path.dirname(__file__), "..", "..", "mock_data", "exchange_options")
         exchange_quotes = fetch_all_exchanges(symbol, mock_dir=mock_dir if not os.environ.get("SYNTH_API_KEY") else None)
+        if exchange_quotes and args.exchange:
+            # If a specific exchange is requested, filter quotes so we only build strategies for that exchange
+            exchange_quotes = [q for q in exchange_quotes if q.exchange == args.exchange]
+            
         if exchange_quotes and candidates:
             divergence_by_strategy = {}
             for c in candidates:
