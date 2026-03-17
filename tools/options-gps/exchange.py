@@ -209,9 +209,26 @@ def _fetch_derive_live(asset: str) -> list[ExchangeQuote]:
         return []
     if not isinstance(markets, list):
         return []
-    active = [m for m in markets if m.get("is_active", True)][:40]
+    active = [m for m in markets if m.get("is_active", True)]
     if not active:
         return []
+
+    # Get current price to sort instruments by distance to ATM
+    try:
+        spot_data = _http_get_json(f"{DERIVE_API}/public/get_ticker", method="POST", json={"instrument_name": f"{asset}-PERP"}, timeout=5)
+        current_price = float(spot_data.get("result", {}).get("mark_price", 0))
+    except Exception:
+        current_price = 0
+
+    def _get_strike(name):
+        try: return float(name.split("-")[-2])
+        except: return 0.0
+
+    if current_price > 0:
+        active.sort(key=lambda m: abs(_get_strike(m.get("instrument_name", "")) - current_price))
+
+    # Take top 60 nearest-the-money options to avoid timeout and guarantee liquid strikes
+    active = active[:60]
 
     def _fetch_one(mkt):
         name = mkt.get("instrument_name", "")
@@ -232,11 +249,9 @@ def _fetch_derive_live(asset: str) -> list[ExchangeQuote]:
             
         bid = float(book.get("best_bid_price", 0))
         ask = float(book.get("best_ask_price", 0))
-        # On testnet, bids and asks are often 0. Let it through so we can test execution.
+        # Wait, if best_bid_price is 0 it means it's illiquid. We shouldn't keep it if both are 0.
         if bid <= 0 and ask <= 0:
-            pass # Keep it, we just want to execute. Or set a fake bid/ask?
-            bid = 1.0 # Fake it to avoid division by zero
-            ask = 2.0
+            return None
             
         mid = (bid + ask) / 2
         
@@ -256,7 +271,7 @@ def _fetch_derive_live(asset: str) -> list[ExchangeQuote]:
         return ExchangeQuote("derive", asset, strike, opt_type, bid, ask, mid, iv)
 
     quotes = []
-    with ThreadPoolExecutor(max_workers=10) as pool:
+    with ThreadPoolExecutor(max_workers=20) as pool:
         futures = [pool.submit(_fetch_one, m) for m in active]
         for f in as_completed(futures):
             try:
