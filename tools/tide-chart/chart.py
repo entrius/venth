@@ -42,11 +42,17 @@ def fetch_all_data(client, horizon: str = "24h") -> dict:
     Returns:
         dict: {asset: {"percentiles": ..., "volatility": ..., "current_price": float}}
     """
+    import time
     assets = get_assets_for_horizon(horizon)
     data = {}
-    for asset in assets:
+    for i, asset in enumerate(assets):
+        print(f"Fetching percentiles for {asset}...", flush=True)
         forecast = client.get_prediction_percentiles(asset, horizon=horizon)
+        time.sleep(1.0)
+        print(f"Fetching volatility for {asset}...", flush=True)
         vol = client.get_volatility(asset, horizon=horizon)
+        time.sleep(1.0)
+        print(f"Done fetching {asset}.", flush=True)
         data[asset] = {
             "current_price": forecast["current_price"],
             "percentiles": forecast["forecast_future"]["percentiles"],

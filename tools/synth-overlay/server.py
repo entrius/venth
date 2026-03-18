@@ -12,6 +12,14 @@ if _here not in sys.path:
     sys.path.insert(0, _here)
 
 from flask import Flask, jsonify, request
+import os
+import sys
+
+from dotenv import load_dotenv
+
+_here = os.path.dirname(os.path.abspath(__file__))
+env_path = os.path.join(_here, "../../.env")
+load_dotenv(env_path)
 
 from synth_client import SynthClient
 

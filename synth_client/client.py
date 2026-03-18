@@ -50,6 +50,7 @@ class SynthClient:
         """
         self.api_key = api_key or os.environ.get("SYNTH_API_KEY")
         self.mock_mode = self.api_key is None
+        self.session = requests.Session() if _HAS_REQUESTS else None
 
         if self.mock_mode:
             warnings.warn(
@@ -77,7 +78,7 @@ class SynthClient:
             )
 
         headers = {"Authorization": f"Apikey {self.api_key}"}
-        resp = requests.get(f"{BASE_URL}{path}", headers=headers, params=params, timeout=30)
+        resp = self.session.get(f"{BASE_URL}{path}", headers=headers, params=params, timeout=5)
         resp.raise_for_status()
         return resp.json()
 
@@ -105,7 +106,14 @@ class SynthClient:
         """
         if self.mock_mode:
             return self._load_mock(*mock_path_parts)
-        return self._request(path, params)
+        try:
+            return self._request(path, params)
+        except requests.exceptions.RequestException as e:
+            warnings.warn(f"Live API failed for {path} with params {params}: {e}. Falling back to mock data.", stacklevel=2)
+            try:
+                return self._load_mock(*mock_path_parts)
+            except Exception as mock_err:
+                raise RuntimeError(f"Live API failed AND mock data unavailable: {e}") from mock_err
 
     # ─── Prediction Percentiles ──────────────────────────────────────
 
