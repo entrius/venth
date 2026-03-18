@@ -134,8 +134,10 @@ def test_non_crypto_skips_exchange():
 
 def test_exchange_failure_graceful():
     """Invalid mock dir -> empty quotes -> ranking proceeds normally."""
-    quotes = fetch_all_exchanges("BTC", mock_dir="/nonexistent/path")
-    assert quotes == []
+    import unittest.mock as mock
+    with mock.patch("exchange.fetch_derive", return_value=[]):
+        quotes = fetch_all_exchanges("BTC", mock_dir="/nonexistent/path")
+        assert quotes == []
 
     candidates = generate_strategies(OPTION_DATA, "bullish", "medium", asset="BTC")
     outcome_prices = [float(P24H[k]) for k in sorted(P24H.keys())]

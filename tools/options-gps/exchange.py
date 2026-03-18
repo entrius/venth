@@ -9,10 +9,11 @@ import os
 from dataclasses import dataclass
 
 CRYPTO_ASSETS = {"BTC", "ETH", "SOL"}
-EXCHANGES = ["deribit", "aevo"]
+EXCHANGES = ["deribit", "aevo", "derive"]
 
 DERIBIT_API = "https://www.deribit.com/api/v2/public"
 AEVO_API = "https://api.aevo.xyz"
+DERIVE_API = "https://api.lyra.finance"
 HTTP_TIMEOUT = 10
 
 
@@ -45,10 +46,13 @@ class EdgeMetrics:
 
 # --- HTTP helper ---
 
-def _http_get_json(url: str, timeout: int = HTTP_TIMEOUT) -> dict | list:
-    """GET JSON from URL. Raises on failure."""
+def _http_get_json(url: str, timeout: int = HTTP_TIMEOUT, method: str = "GET", **kwargs) -> dict | list:
+    """GET/POST JSON from URL. Raises on failure."""
     import requests as _req
-    resp = _req.get(url, timeout=timeout, headers={"Accept": "application/json"})
+    headers = kwargs.pop("headers", {})
+    if "Accept" not in headers:
+        headers["Accept"] = "application/json"
+    resp = _req.request(method, url, timeout=timeout, headers=headers, **kwargs)
     resp.raise_for_status()
     return resp.json()
 
@@ -75,11 +79,27 @@ def fetch_aevo(asset: str, mock_dir: str | None = None) -> list[ExchangeQuote]:
     return _fetch_aevo_live(asset)
 
 
+def fetch_derive(asset: str, mock_dir: str | None = None) -> list[ExchangeQuote]:
+    """Fetch option quotes from Derive. Mock JSON when mock_dir is provided,
+    otherwise live from Derive public API (no auth needed)."""
+    if asset not in CRYPTO_ASSETS:
+        return []
+    if mock_dir is not None:
+        try:
+            quotes = _load_mock(asset, mock_dir, "derive")
+            if quotes:
+                return quotes
+        except FileNotFoundError:
+            pass
+        # Fallback to live data if mock is missing (common for new integrations)
+    return _fetch_derive_live(asset)
+
+
 def fetch_all_exchanges(asset: str, mock_dir: str | None = None) -> list[ExchangeQuote]:
     """Fetch quotes from all supported exchanges and combine."""
     if asset not in CRYPTO_ASSETS:
         return []
-    return fetch_deribit(asset, mock_dir) + fetch_aevo(asset, mock_dir)
+    return fetch_deribit(asset, mock_dir) + fetch_aevo(asset, mock_dir) + fetch_derive(asset, mock_dir)
 
 
 def _fetch_deribit_live(asset: str) -> list[ExchangeQuote]:
@@ -166,6 +186,92 @@ def _fetch_aevo_live(asset: str) -> list[ExchangeQuote]:
 
     quotes = []
     with ThreadPoolExecutor(max_workers=10) as pool:
+        futures = [pool.submit(_fetch_one, m) for m in active]
+        for f in as_completed(futures):
+            try:
+                q = f.result()
+                if q:
+                    quotes.append(q)
+            except Exception:
+                pass
+    return quotes
+
+
+def _fetch_derive_live(asset: str) -> list[ExchangeQuote]:
+    """Fetch option quotes from Derive public API.
+    Discovers instruments via /get_instruments, fetches tickers in parallel."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    try:
+        data = _http_get_json(f"{DERIVE_API}/public/get_instruments", method="POST", json={"currency": asset, "instrument_type": "option", "expired": False})
+        markets = data.get("result", [])
+    except Exception:
+        return []
+    if not isinstance(markets, list):
+        return []
+    active = [m for m in markets if m.get("is_active", True)]
+    if not active:
+        return []
+
+    # Get current price to sort instruments by distance to ATM
+    try:
+        spot_data = _http_get_json(f"{DERIVE_API}/public/get_ticker", method="POST", json={"instrument_name": f"{asset}-PERP"}, timeout=5)
+        current_price = float(spot_data.get("result", {}).get("mark_price", 0))
+    except Exception:
+        current_price = 0
+
+    def _get_strike(name):
+        try: return float(name.split("-")[-2])
+        except: return 0.0
+
+    if current_price > 0:
+        active.sort(key=lambda m: abs(_get_strike(m.get("instrument_name", "")) - current_price))
+
+    # Take top 60 nearest-the-money options to avoid timeout and guarantee liquid strikes
+    active = active[:60]
+
+    def _fetch_one(mkt):
+        name = mkt.get("instrument_name", "")
+        if not name:
+            return None
+        parts = name.split("-")
+        try:
+            strike = float(parts[-2])
+            opt_type = "call" if parts[-1] == "C" else "put"
+        except (IndexError, ValueError):
+            return None
+        
+        try:
+            ticker_data = _http_get_json(f"{DERIVE_API}/public/get_ticker", method="POST", json={"instrument_name": name}, timeout=5)
+            book = ticker_data.get("result", {})
+        except Exception:
+            return None
+            
+        bid = float(book.get("best_bid_price", 0))
+        ask = float(book.get("best_ask_price", 0))
+        # Wait, if best_bid_price is 0 it means it's illiquid. We shouldn't keep it if both are 0.
+        if bid <= 0 and ask <= 0:
+            return None
+            
+        mid = (bid + ask) / 2
+        
+        pricing = book.get("option_pricing", {})
+        bid_iv = float(pricing.get("bid_iv", 0))
+        ask_iv = float(pricing.get("ask_iv", 0))
+        iv = None
+        if bid_iv > 0 and ask_iv > 0:
+            iv = (bid_iv + ask_iv) / 2
+        elif bid_iv > 0:
+            iv = bid_iv
+        elif ask_iv > 0:
+            iv = ask_iv
+        if not iv and pricing.get("iv"):
+            iv = float(pricing.get("iv", 0))
+
+        return ExchangeQuote("derive", asset, strike, opt_type, bid, ask, mid, iv)
+
+    quotes = []
+    with ThreadPoolExecutor(max_workers=20) as pool:
         futures = [pool.submit(_fetch_one, m) for m in active]
         for f in as_completed(futures):
             try:
@@ -348,6 +454,11 @@ def _load_mock(asset: str, mock_dir: str, exchange: str) -> list[ExchangeQuote]:
             ask = float(asks[0][0])
             bid_iv = float(bids[0][2]) if len(bids[0]) > 2 else None
             ask_iv = float(asks[0][2]) if len(asks[0]) > 2 else None
+        elif exchange == "derive":
+            bid = float(book.get("best_bid_price", book.get("bid", 0)))
+            ask = float(book.get("best_ask_price", book.get("ask", 0)))
+            bid_iv = None
+            ask_iv = None
         else:
             bid = float(book.get("bid", 0))
             ask = float(book.get("ask", 0))

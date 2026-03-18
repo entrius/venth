@@ -35,7 +35,7 @@ class TestFetchParse:
 
     def test_all_exchanges_mock(self, mock_exchange_dir):
         quotes = fetch_all_exchanges("BTC", mock_dir=mock_exchange_dir)
-        assert {"deribit", "aevo"} == {q.exchange for q in quotes}
+        assert {"deribit", "aevo", "derive"} == {q.exchange for q in quotes}
 
     def test_non_crypto_returns_empty(self, mock_exchange_dir):
         for asset in ("XAU", "SPY", "NVDA", "TSLA", "AAPL", "GOOGL"):
